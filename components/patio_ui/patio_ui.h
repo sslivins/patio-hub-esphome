@@ -62,6 +62,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void toggle_screen_sel(int idx);
   void request_cover_action(int action);  // 1=open, 2=close, 3=stop (uses selection)
 
+  // Refreshes the bottom page-position dots (called from the tileview scroll cb).
+  void update_page_dots_();  // LVGL task only
+
   // Binds a screen index to its LVGL tap callback.
   struct ScreenTap {
     PatioUI *self{nullptr};
@@ -97,6 +100,11 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- LVGL widgets (LVGL task only) ---
   lv_obj_t *heater_value_{nullptr};
   lv_timer_t *tick_timer_{nullptr};
+
+  // tileview + bottom page-position dots (LVGL task only)
+  lv_obj_t *tv_{nullptr};
+  lv_obj_t *tiles_[3]{};
+  lv_obj_t *page_dots_[3]{};
 
   // screen tile widgets (LVGL task only)
   lv_obj_t *screen_btn_[NUM_SCREENS]{};

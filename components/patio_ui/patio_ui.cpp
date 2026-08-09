@@ -12,7 +12,10 @@
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
 #include "png_uncompressed.h"
+
+#include "esphome/core/application.h"
 
 #include <cstdio>
 #include <cstring>
@@ -59,6 +62,9 @@ static void ev_down(lv_event_t *e) {  // screen comes down = close
 }
 static void ev_cover_stop(lv_event_t *e) {
   static_cast<PatioUI *>(lv_event_get_user_data(e))->request_cover_action(3);
+}
+static void ev_tile_scroll(lv_event_t *e) {  // active tile changed -> update dots
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->update_page_dots_();
 }
 
 static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb, void *user) {
@@ -167,10 +173,15 @@ void PatioUI::build_ui_() {
 
   lv_obj_t *tv = lv_tileview_create(scr);
   lv_obj_set_style_bg_opa(tv, LV_OPA_TRANSP, 0);
+  lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);  // replaced by page dots below
+  this->tv_ = tv;
 
   lv_obj_t *t_heater = lv_tileview_add_tile(tv, 0, 0, LV_DIR_HOR);
   lv_obj_t *t_lights = lv_tileview_add_tile(tv, 1, 0, LV_DIR_HOR);
   lv_obj_t *t_screens = lv_tileview_add_tile(tv, 2, 0, LV_DIR_HOR);
+  this->tiles_[0] = t_heater;
+  this->tiles_[1] = t_lights;
+  this->tiles_[2] = t_screens;
 
   // --- heater tile (live, wired to HA) ---
   lv_obj_set_style_bg_color(t_heater, COL_HEATER, 0);
@@ -205,9 +216,46 @@ void PatioUI::build_ui_() {
   // --- screens tile (live perimeter map, wired to HA covers) ---
   this->build_screens_tile_(t_screens);
 
+  // Bottom page-position dots (replaces the tileview scroll line). Live on the
+  // screen so they float over every tile; updated when the active tile changes.
+  lv_obj_t *dots = lv_obj_create(scr);
+  lv_obj_remove_style_all(dots);
+  lv_obj_set_size(dots, 70, 14);
+  lv_obj_align(dots, LV_ALIGN_BOTTOM_MID, 0, -3);
+  lv_obj_set_flex_flow(dots, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(dots, 9, 0);
+  lv_obj_clear_flag(dots, LV_OBJ_FLAG_CLICKABLE);
+  for (int i = 0; i < 3; i++) {
+    lv_obj_t *d = lv_obj_create(dots);
+    lv_obj_remove_style_all(d);
+    lv_obj_set_size(d, 8, 8);
+    lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(d, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_40, 0);
+    lv_obj_clear_flag(d, LV_OBJ_FLAG_CLICKABLE);
+    this->page_dots_[i] = d;
+  }
+  lv_obj_add_event_cb(tv, ev_tile_scroll, LV_EVENT_VALUE_CHANGED, this);
+  lv_obj_add_event_cb(tv, ev_tile_scroll, LV_EVENT_SCROLL_END, this);
+  this->update_page_dots_();
+
   // 1 Hz refresh/countdown driver (LVGL task)
   this->tick_timer_ = lv_timer_create(PatioUI::tick_cb_, 1000, this);
   this->refresh_heater_label_();
+}
+
+// Highlights the dot for the currently-active tile (bright), dims the others.
+void PatioUI::update_page_dots_() {
+  if (this->tv_ == nullptr)
+    return;
+  lv_obj_t *active = lv_tileview_get_tile_active(this->tv_);
+  for (int i = 0; i < 3; i++) {
+    if (this->page_dots_[i] == nullptr)
+      continue;
+    bool on = (this->tiles_[i] == active);
+    lv_obj_set_style_bg_opa(this->page_dots_[i], on ? LV_OPA_COVER : LV_OPA_40, 0);
+  }
 }
 
 // ---------------- public request API (called from LVGL task) ----------------
@@ -281,11 +329,11 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   // Left (slot 0) / Right (slot 1): thin, tall side tiles on the edges, with a
   // vertical valance bar so they read as side-wall-mounted (different from rear).
   this->screen_btn_[0] = make_screen_button(tile, &this->screen_tap_[0], SCR_LEFT);
-  lv_obj_set_size(this->screen_btn_[0], 52, 132);
+  lv_obj_set_size(this->screen_btn_[0], 52, 100);
   lv_obj_align(this->screen_btn_[0], LV_ALIGN_TOP_LEFT, 8, 32);
 
   this->screen_btn_[1] = make_screen_button(tile, &this->screen_tap_[1], SCR_RIGHT);
-  lv_obj_set_size(this->screen_btn_[1], 52, 132);
+  lv_obj_set_size(this->screen_btn_[1], 52, 100);
   lv_obj_align(this->screen_btn_[1], LV_ALIGN_TOP_RIGHT, -8, 32);
 
   // Rear Left (slot 2) / Rear Right (slot 3): the two side-by-side screens on the
@@ -293,11 +341,11 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   // sitting just above the control bar.
   this->screen_btn_[2] = make_screen_button(tile, &this->screen_tap_[2], SCR_REAR);
   lv_obj_set_size(this->screen_btn_[2], 88, 52);
-  lv_obj_align(this->screen_btn_[2], LV_ALIGN_BOTTOM_MID, -47, -60);
+  lv_obj_align(this->screen_btn_[2], LV_ALIGN_BOTTOM_MID, -47, -74);
 
   this->screen_btn_[3] = make_screen_button(tile, &this->screen_tap_[3], SCR_REAR);
   lv_obj_set_size(this->screen_btn_[3], 88, 52);
-  lv_obj_align(this->screen_btn_[3], LV_ALIGN_BOTTOM_MID, 47, -60);
+  lv_obj_align(this->screen_btn_[3], LV_ALIGN_BOTTOM_MID, 47, -74);
 
   // Control bar: up (open) / stop / down (close) — acts on the selection.
   // Somfy RTS has no feedback, so these are momentary commands, not toggles.
@@ -305,7 +353,7 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   lv_obj_t *bar = lv_obj_create(tile);
   lv_obj_remove_style_all(bar);
   lv_obj_set_size(bar, 320, 50);
-  lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -4);
+  lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -22);
   lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   this->ctrl_up_ = make_btn(bar, LV_SYMBOL_UP, ev_up, this);
@@ -494,6 +542,34 @@ static esp_err_t screenshot_get_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// Lightweight build/health probe so we can confirm exactly which firmware image
+// is actually running (crash-rollback can silently revert to a prior image).
+// The app ELF SHA-256 uniquely identifies the build; date/time come from the
+// same esp_app_desc baked in at link time.
+//   curl http://<device-ip>:8080/status
+static esp_err_t status_get_handler(httpd_req_t *req) {
+  const esp_app_desc_t *d = esp_app_get_description();
+  char sha[17] = {0};
+  for (int i = 0; i < 8; i++)
+    snprintf(sha + i * 2, 3, "%02x", d->app_elf_sha256[i]);
+
+  char build_time[App.BUILD_TIME_STR_SIZE] = {0};
+  App.get_build_time_string(build_time);
+
+  char body[512];
+  int n = snprintf(body, sizeof(body),
+                   "{\"project\":\"%s\",\"esphome\":\"%s\",\"compiled\":\"%s\","
+                   "\"idf\":\"%s\",\"elf_sha256\":\"%s\","
+                   "\"uptime_s\":%lld,\"free_heap\":%u,\"free_psram\":%u}",
+                   d->project_name, d->version, build_time, d->idf_ver, sha,
+                   (long long) (esp_timer_get_time() / 1000000),
+                   (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                   (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, body, n);
+  return ESP_OK;
+}
+
 void PatioUI::start_screenshot_server_() {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 8080;
@@ -510,8 +586,15 @@ void PatioUI::start_screenshot_server_() {
   uri.method = HTTP_GET;
   uri.handler = screenshot_get_handler;
   httpd_register_uri_handler(server, &uri);
+
+  httpd_uri_t status_uri = {};
+  status_uri.uri = "/status";
+  status_uri.method = HTTP_GET;
+  status_uri.handler = status_get_handler;
+  httpd_register_uri_handler(server, &status_uri);
+
   this->screenshot_httpd_ = server;
-  ESP_LOGI(TAG, "screenshot endpoint at http://<ip>:8080/screenshot");
+  ESP_LOGI(TAG, "http endpoints on :8080  /screenshot  /status");
 }
 
 void PatioUI::setup() {
@@ -520,6 +603,11 @@ void PatioUI::setup() {
   // The BSP (our esp-bsp fork) initialises the new-i2c bus, powers the AXP2101
   // LCD rails and pulses the ALDO2 LCD/touch reset itself, then brings up the
   // esp_lcd SPI panel + FT6336 touch + esp_lvgl_port DMA flush pipeline.
+  //
+  // NOTE: a full-frame PSRAM draw buffer (bsp_display_start_with_config, buffer
+  // in SPIRAM) crashes in LVGL wait_for_flushing on this BSP — the SPI bus is
+  // set up for the compile-time 50-row buffer, so an oversized/PSRAM flush
+  // faults. Stick with the BSP default (50-row double DMA buffer) here.
   lv_display_t *disp = bsp_display_start();
   if (disp == nullptr) {
     ESP_LOGE(TAG, "bsp_display_start failed");
