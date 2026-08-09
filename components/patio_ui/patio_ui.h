@@ -60,7 +60,6 @@ class PatioUI : public Component, public api::CustomAPIDevice {
 
   // Screen intents (called from the LVGL task; touch LVGL + selection only).
   void toggle_screen_sel(int idx);
-  void toggle_all_sel();
   void request_cover_action(int action);  // 1=open, 2=close, 3=stop (uses selection)
 
   // Binds a screen index to its LVGL tap callback.
@@ -101,7 +100,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
 
   // screen tile widgets (LVGL task only)
   lv_obj_t *screen_btn_[NUM_SCREENS]{};
-  lv_obj_t *all_btn_{nullptr};
+  lv_obj_t *ctrl_up_{nullptr};
+  lv_obj_t *ctrl_stop_{nullptr};
+  lv_obj_t *ctrl_down_{nullptr};
 
   // --- screen config / selection ---
   std::string screen_entity_[NUM_SCREENS];
