@@ -604,10 +604,16 @@ void PatioUI::setup() {
   // LCD rails and pulses the ALDO2 LCD/touch reset itself, then brings up the
   // esp_lcd SPI panel + FT6336 touch + esp_lvgl_port DMA flush pipeline.
   //
-  // NOTE: a full-frame PSRAM draw buffer (bsp_display_start_with_config, buffer
-  // in SPIRAM) crashes in LVGL wait_for_flushing on this BSP — the SPI bus is
-  // set up for the compile-time 50-row buffer, so an oversized/PSRAM flush
-  // faults. Stick with the BSP default (50-row double DMA buffer) here.
+  // Tearing note (Core2 / ESP32-classic): the BSP default is a 50-row double
+  // DMA buffer, so a full-screen change (swiping tiles) is flushed as ~5
+  // horizontal bands that land a few ms apart — the "stripes" seen while
+  // scrolling. The clean fix is a full-frame render buffer, but on this SoC it
+  // is not achievable via esp_lvgl_port: SOC_PSRAM_DMA_CAPABLE == 0 (SPI DMA
+  // cannot read PSRAM), and a full 320x240xRGB565 frame (150 KB) does not fit
+  // in internal DMA RAM. A full-frame PSRAM buffer therefore faults in LVGL
+  // wait_for_flushing (the flush DMAs straight from the PSRAM px_map). This is
+  // fixed for free on the CoreS3 (ESP32-S3, SOC_PSRAM_DMA_CAPABLE == 1), where
+  // buff_dma+buff_spiram is supported — defer the tear-free path to that board.
   lv_display_t *disp = bsp_display_start();
   if (disp == nullptr) {
     ESP_LOGE(TAG, "bsp_display_start failed");
