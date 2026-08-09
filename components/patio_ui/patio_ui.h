@@ -76,16 +76,12 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- Home Assistant state subscriptions (run on main/API task) ---
   void on_timer_state_(std::string state);
   void on_timer_remaining_(std::string remaining);
-  void on_screen_state_(std::string entity_id, std::string state);
-  void on_screen_position_(std::string entity_id, std::string position);
-  int find_screen_index_(const std::string &entity_id) const;
 
   // --- LVGL-task helpers ---
   static void tick_cb_(lv_timer_t *t);
   void tick_();               // 1 Hz, LVGL task
   void refresh_heater_label_();  // LVGL task only
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
-  void refresh_screen_labels_();             // LVGL task only
   void update_screen_visual_();              // LVGL task only
 
   // --- config ---
@@ -101,7 +97,6 @@ class PatioUI : public Component, public api::CustomAPIDevice {
 
   // screen tile widgets (LVGL task only)
   lv_obj_t *screen_btn_[NUM_SCREENS]{};
-  lv_obj_t *screen_state_lbl_[NUM_SCREENS]{};
   lv_obj_t *all_btn_{nullptr};
 
   // --- screen config / selection ---
@@ -119,11 +114,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::atomic<bool> pending_stop_{false};
   std::atomic<bool> label_dirty_{true};       // request LVGL-task label refresh
 
-  // screens: HA -> UI state, and UI -> HA pending cover action
-  std::atomic<int> screen_pos_[NUM_SCREENS];     // -1 unknown, else 0..100
-  std::atomic<int> screen_state_code_[NUM_SCREENS];  // 0 unk,1 closed,2 open,3 opening,4 closing
-  std::atomic<bool> screen_dirty_{false};
-  std::atomic<int> pending_cover_action_{0};     // 0 none,1 open,2 close,3 stop
+  // screens: UI -> HA pending cover action (Somfy RTS = command-only, no state)
+  std::atomic<int> pending_cover_action_{0};     // 0 none,1 open/up,2 close/down,3 stop
   std::atomic<unsigned> pending_cover_mask_{0};  // bitmask of selected screens
 };
 

@@ -101,8 +101,6 @@ async def to_code(config):
 
     # --- LVGL (v9, pulled in via esp_lvgl_port) ---
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_TILEVIEW", True)
-    esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_14", True)
-    esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_16", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_20", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_28", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_48", True)

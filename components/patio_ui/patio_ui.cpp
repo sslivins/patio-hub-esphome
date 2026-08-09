@@ -50,10 +50,10 @@ static void ev_all(lv_event_t *e) {
   auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
   self->toggle_all_sel();
 }
-static void ev_open(lv_event_t *e) {
+static void ev_up(lv_event_t *e) {  // screen goes up = open
   static_cast<PatioUI *>(lv_event_get_user_data(e))->request_cover_action(1);
 }
-static void ev_close(lv_event_t *e) {
+static void ev_down(lv_event_t *e) {  // screen comes down = close
   static_cast<PatioUI *>(lv_event_get_user_data(e))->request_cover_action(2);
 }
 static void ev_cover_stop(lv_event_t *e) {
@@ -74,31 +74,40 @@ static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb, v
   return btn;
 }
 
-// A perimeter "screen" button: name on top, live state below. Tapping it
-// toggles selection (handled by ev_screen_tap via the ScreenTap user data).
-static lv_obj_t *make_screen_button(lv_obj_t *parent, const char *name, const lv_font_t *name_font,
-                                    lv_obj_t **out_state, const lv_font_t *state_font, void *user) {
+// A perimeter "screen" tile drawn as a little roller-shade icon (no text —
+// its on-screen position tells you which physical screen it is). Tapping it
+// toggles selection (ev_screen_tap via the ScreenTap user data). Somfy RTS
+// screens report no real state, so nothing dynamic is shown here.
+static lv_obj_t *make_screen_button(lv_obj_t *parent, void *user) {
   lv_obj_t *btn = lv_button_create(parent);
   lv_obj_set_style_bg_color(btn, COL_SCREEN_TILE, 0);
   lv_obj_set_style_radius(btn, 8, 0);
   lv_obj_set_style_border_color(btn, lv_color_white(), 0);
   lv_obj_set_style_border_width(btn, 1, 0);
   lv_obj_set_style_border_opa(btn, LV_OPA_40, 0);
-  lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_all(btn, 2, 0);
-  lv_obj_set_style_pad_row(btn, 2, 0);
+  lv_obj_set_style_pad_all(btn, 0, 0);
 
-  lv_obj_t *nm = lv_label_create(btn);
-  lv_label_set_text(nm, name);
-  lv_obj_set_style_text_color(nm, lv_color_white(), 0);
-  lv_obj_set_style_text_font(nm, name_font, 0);
+  // window pane (inset lighter rect)
+  lv_obj_t *pane = lv_obj_create(btn);
+  lv_obj_remove_style_all(pane);
+  lv_obj_set_size(pane, LV_PCT(72), LV_PCT(70));
+  lv_obj_center(pane);
+  lv_obj_set_style_bg_color(pane, lv_color_hex(0x2E6B7A), 0);
+  lv_obj_set_style_bg_opa(pane, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(pane, 3, 0);
+  lv_obj_clear_flag(pane, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(pane, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-  lv_obj_t *st = lv_label_create(btn);
-  lv_label_set_text(st, "--");
-  lv_obj_set_style_text_color(st, lv_color_hex(0xCFE8EF), 0);
-  lv_obj_set_style_text_font(st, state_font, 0);
-  *out_state = st;
+  // roller/valance bar across the top of the pane
+  lv_obj_t *roller = lv_obj_create(pane);
+  lv_obj_remove_style_all(roller);
+  lv_obj_set_size(roller, LV_PCT(100), 7);
+  lv_obj_align(roller, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_bg_color(roller, lv_color_hex(0x0E3540), 0);
+  lv_obj_set_style_bg_opa(roller, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(roller, 3, 0);
+  lv_obj_clear_flag(roller, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(roller, LV_OBJ_FLAG_EVENT_BUBBLE);
 
   lv_obj_add_event_cb(btn, ev_screen_tap, LV_EVENT_CLICKED, user);
   return btn;
@@ -213,8 +222,6 @@ void PatioUI::tick_() {
   }
   if (this->label_dirty_.exchange(false))
     this->refresh_heater_label_();
-  if (this->screen_dirty_.exchange(false))
-    this->refresh_screen_labels_();
 }
 
 void PatioUI::refresh_heater_label_() {
@@ -238,8 +245,6 @@ void PatioUI::refresh_heater_label_() {
 
 // ---------------- screens tile (LVGL task) ----------------
 void PatioUI::build_screens_tile_(lv_obj_t *tile) {
-  static const char *const FALLBACK[NUM_SCREENS] = {"Left", "Right", "Rear L", "Rear R"};
-
   lv_obj_set_style_bg_color(tile, COL_SCREENS, 0);
   lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(tile, 0, 0);
@@ -254,20 +259,13 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
     this->screen_tap_[i].self = this;
     this->screen_tap_[i].idx = i;
   }
-  auto name_of = [&](int i) {
-    return this->screen_configured_[i] ? this->screen_label_[i].c_str() : FALLBACK[i];
-  };
 
-  // Left (slot 0) and Right (slot 1): tall side buttons.
-  this->screen_btn_[0] = make_screen_button(tile, name_of(0), &lv_font_montserrat_20,
-                                            &this->screen_state_lbl_[0], &lv_font_montserrat_16,
-                                            &this->screen_tap_[0]);
+  // Left (slot 0) and Right (slot 1): tall side tiles.
+  this->screen_btn_[0] = make_screen_button(tile, &this->screen_tap_[0]);
   lv_obj_set_size(this->screen_btn_[0], 72, 118);
   lv_obj_align(this->screen_btn_[0], LV_ALIGN_TOP_LEFT, 6, 30);
 
-  this->screen_btn_[1] = make_screen_button(tile, name_of(1), &lv_font_montserrat_20,
-                                            &this->screen_state_lbl_[1], &lv_font_montserrat_16,
-                                            &this->screen_tap_[1]);
+  this->screen_btn_[1] = make_screen_button(tile, &this->screen_tap_[1]);
   lv_obj_set_size(this->screen_btn_[1], 72, 118);
   lv_obj_align(this->screen_btn_[1], LV_ALIGN_TOP_RIGHT, -6, 30);
 
@@ -288,31 +286,28 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
 
   // Rear Left (slot 2) / Rear Right (slot 3): the two side-by-side screens
   // behind the viewer, shown as a bottom-center pair.
-  this->screen_btn_[2] = make_screen_button(tile, name_of(2), &lv_font_montserrat_16,
-                                            &this->screen_state_lbl_[2], &lv_font_montserrat_14,
-                                            &this->screen_tap_[2]);
+  this->screen_btn_[2] = make_screen_button(tile, &this->screen_tap_[2]);
   lv_obj_set_size(this->screen_btn_[2], 72, 42);
   lv_obj_align(this->screen_btn_[2], LV_ALIGN_TOP_MID, -42, 100);
 
-  this->screen_btn_[3] = make_screen_button(tile, name_of(3), &lv_font_montserrat_16,
-                                            &this->screen_state_lbl_[3], &lv_font_montserrat_14,
-                                            &this->screen_tap_[3]);
+  this->screen_btn_[3] = make_screen_button(tile, &this->screen_tap_[3]);
   lv_obj_set_size(this->screen_btn_[3], 72, 42);
   lv_obj_align(this->screen_btn_[3], LV_ALIGN_TOP_MID, 42, 100);
 
-  // Control bar: acts on the current selection.
+  // Control bar: up (open) / stop / down (close) — acts on the selection.
+  // Somfy RTS has no feedback, so these are momentary commands, not toggles.
   lv_obj_t *bar = lv_obj_create(tile);
   lv_obj_remove_style_all(bar);
   lv_obj_set_size(bar, 320, 50);
   lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -4);
   lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_t *b_open = make_btn(bar, "Open", ev_open, this);
-  lv_obj_set_size(b_open, 98, 44);
-  lv_obj_t *b_close = make_btn(bar, "Close", ev_close, this);
-  lv_obj_set_size(b_close, 98, 44);
-  lv_obj_t *b_stop = make_btn(bar, "Stop", ev_cover_stop, this);
+  lv_obj_t *b_up = make_btn(bar, LV_SYMBOL_UP, ev_up, this);
+  lv_obj_set_size(b_up, 98, 44);
+  lv_obj_t *b_stop = make_btn(bar, LV_SYMBOL_STOP, ev_cover_stop, this);
   lv_obj_set_size(b_stop, 98, 44);
+  lv_obj_t *b_down = make_btn(bar, LV_SYMBOL_DOWN, ev_down, this);
+  lv_obj_set_size(b_down, 98, 44);
 
   // Hide any unconfigured slots.
   for (int i = 0; i < NUM_SCREENS; i++) {
@@ -321,34 +316,9 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   }
 
   this->update_screen_visual_();
-  this->refresh_screen_labels_();
 }
 
-void PatioUI::refresh_screen_labels_() {
-  for (int i = 0; i < NUM_SCREENS; i++) {
-    if (!this->screen_configured_[i] || this->screen_state_lbl_[i] == nullptr)
-      continue;
-    char buf[12];
-    int code = this->screen_state_code_[i].load();
-    if (code == 3) {
-      snprintf(buf, sizeof(buf), "Opening");
-    } else if (code == 4) {
-      snprintf(buf, sizeof(buf), "Closing");
-    } else {
-      int p = this->screen_pos_[i].load();
-      if (p < 0)
-        snprintf(buf, sizeof(buf), "--");
-      else if (p <= 0)
-        snprintf(buf, sizeof(buf), "Closed");
-      else if (p >= 100)
-        snprintf(buf, sizeof(buf), "Open");
-      else
-        snprintf(buf, sizeof(buf), "%d%%", p);
-    }
-    lv_label_set_text(this->screen_state_lbl_[i], buf);
-  }
-}
-
+// ---------------- selection highlight (LVGL task) ----------------
 void PatioUI::update_screen_visual_() {
   bool all_sel = true;
   bool any_cfg = false;
@@ -425,14 +395,6 @@ void PatioUI::request_cover_action(int action) {
   this->pending_cover_action_.store(action);
 }
 
-int PatioUI::find_screen_index_(const std::string &entity_id) const {
-  for (int i = 0; i < NUM_SCREENS; i++) {
-    if (this->screen_configured_[i] && this->screen_entity_[i] == entity_id)
-      return i;
-  }
-  return -1;
-}
-
 // ---------------- Home Assistant state callbacks (main/API task) ----------------
 void PatioUI::on_timer_state_(std::string state) {
   bool active = (state == "active");
@@ -453,49 +415,9 @@ void PatioUI::on_timer_remaining_(std::string remaining) {
   }
 }
 
-void PatioUI::on_screen_state_(std::string entity_id, std::string state) {
-  int idx = this->find_screen_index_(entity_id);
-  if (idx < 0)
-    return;
-  int code = 0;
-  if (state == "closed")
-    code = 1;
-  else if (state == "open")
-    code = 2;
-  else if (state == "opening")
-    code = 3;
-  else if (state == "closing")
-    code = 4;
-  this->screen_state_code_[idx].store(code);
-  this->screen_dirty_.store(true);
-  ESP_LOGD(TAG, "screen %d (%s) state: %s", idx, entity_id.c_str(), state.c_str());
-}
-
-void PatioUI::on_screen_position_(std::string entity_id, std::string position) {
-  int idx = this->find_screen_index_(entity_id);
-  if (idx < 0)
-    return;
-  int p = -1;
-  if (!position.empty() && position != "unknown" && position != "unavailable" && position != "None") {
-    p = (int) strtol(position.c_str(), nullptr, 10);
-    if (p < 0)
-      p = 0;
-    if (p > 100)
-      p = 100;
-  }
-  this->screen_pos_[idx].store(p);
-  this->screen_dirty_.store(true);
-  ESP_LOGD(TAG, "screen %d (%s) position: %s (%d)", idx, entity_id.c_str(), position.c_str(), p);
-}
-
 // ---------------- ESPHome Component ----------------
 void PatioUI::setup() {
   ESP_LOGI(TAG, "bringing up Core2 display + LVGL");
-
-  for (int i = 0; i < NUM_SCREENS; i++) {
-    this->screen_pos_[i].store(-1);
-    this->screen_state_code_[i].store(0);
-  }
 
   // The BSP (our esp-bsp fork) initialises the new-i2c bus, powers the AXP2101
   // LCD rails and pulses the ALDO2 LCD/touch reset itself, then brings up the
@@ -517,14 +439,9 @@ void PatioUI::setup() {
   this->subscribe_homeassistant_state(&PatioUI::on_timer_state_, this->timer_entity_);
   this->subscribe_homeassistant_state(&PatioUI::on_timer_remaining_, this->timer_entity_, "remaining");
 
-  // Subscribe to each configured screen cover: state (open/closed/moving) + position.
-  for (int i = 0; i < NUM_SCREENS; i++) {
-    if (!this->screen_configured_[i])
-      continue;
-    this->subscribe_homeassistant_state(&PatioUI::on_screen_state_, this->screen_entity_[i]);
-    this->subscribe_homeassistant_state(&PatioUI::on_screen_position_, this->screen_entity_[i],
-                                        "current_position");
-  }
+  // Screens are Somfy RTS (command-only, no reliable state feedback), so we
+  // don't subscribe to their state — the tiles are selectors + momentary
+  // up/stop/down commands.
 
   ESP_LOGI(TAG, "UI up; heater tile bound to %s", this->timer_entity_.c_str());
 }
