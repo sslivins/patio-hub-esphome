@@ -113,7 +113,7 @@ static lv_obj_t *make_screen_button(lv_obj_t *parent, void *user, ScreenOrient o
   lv_obj_remove_style_all(roller);
   if (orient == SCR_REAR) {
     lv_obj_set_size(roller, LV_PCT(100), 7);
-    lv_obj_align(roller, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(roller, LV_ALIGN_BOTTOM_MID, 0, 0);
   } else if (orient == SCR_LEFT) {
     lv_obj_set_size(roller, 7, LV_PCT(100));
     lv_obj_align(roller, LV_ALIGN_LEFT_MID, 0, 0);
@@ -292,11 +292,11 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   // far wall behind the viewer — a centered landscape pair (horizontal valance),
   // sitting just above the control bar.
   this->screen_btn_[2] = make_screen_button(tile, &this->screen_tap_[2], SCR_REAR);
-  lv_obj_set_size(this->screen_btn_[2], 88, 58);
+  lv_obj_set_size(this->screen_btn_[2], 88, 52);
   lv_obj_align(this->screen_btn_[2], LV_ALIGN_BOTTOM_MID, -47, -60);
 
   this->screen_btn_[3] = make_screen_button(tile, &this->screen_tap_[3], SCR_REAR);
-  lv_obj_set_size(this->screen_btn_[3], 88, 58);
+  lv_obj_set_size(this->screen_btn_[3], 88, 52);
   lv_obj_align(this->screen_btn_[3], LV_ALIGN_BOTTOM_MID, 47, -60);
 
   // Control bar: up (open) / stop / down (close) — acts on the selection.
