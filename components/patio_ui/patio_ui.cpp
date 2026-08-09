@@ -289,14 +289,15 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   lv_obj_align(this->screen_btn_[1], LV_ALIGN_TOP_RIGHT, -8, 32);
 
   // Rear Left (slot 2) / Rear Right (slot 3): the two side-by-side screens on the
-  // far wall behind the viewer — a centered landscape pair (horizontal valance).
+  // far wall behind the viewer — a centered landscape pair (horizontal valance),
+  // sitting just above the control bar.
   this->screen_btn_[2] = make_screen_button(tile, &this->screen_tap_[2], SCR_REAR);
   lv_obj_set_size(this->screen_btn_[2], 88, 58);
-  lv_obj_align(this->screen_btn_[2], LV_ALIGN_TOP_MID, -47, 45);
+  lv_obj_align(this->screen_btn_[2], LV_ALIGN_BOTTOM_MID, -47, -60);
 
   this->screen_btn_[3] = make_screen_button(tile, &this->screen_tap_[3], SCR_REAR);
   lv_obj_set_size(this->screen_btn_[3], 88, 58);
-  lv_obj_align(this->screen_btn_[3], LV_ALIGN_TOP_MID, 47, 45);
+  lv_obj_align(this->screen_btn_[3], LV_ALIGN_BOTTOM_MID, 47, -60);
 
   // Control bar: up (open) / stop / down (close) — acts on the selection.
   // Somfy RTS has no feedback, so these are momentary commands, not toggles.
