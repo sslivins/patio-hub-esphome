@@ -9,6 +9,11 @@
 #include "bsp/esp-bsp.h"
 #include "lvgl.h"
 
+#include "esp_http_server.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "png_uncompressed.h"
+
 #include <cstdio>
 #include <cstring>
 
@@ -416,6 +421,100 @@ void PatioUI::on_timer_remaining_(std::string remaining) {
 }
 
 // ---------------- ESPHome Component ----------------
+// ---------------- screenshot HTTP endpoint ----------------
+// Grab the live LVGL framebuffer and stream it as an uncompressed PNG, mirroring
+// the arctic-controller /api/screenshot mechanism. Lets us (and CI) see exactly
+// what the panel is rendering without a physical photo. Served on port 8080:
+//   curl http://<device-ip>:8080/screenshot -o shot.png
+static esp_err_t png_http_write(void *ctx, const void *buf, size_t len) {
+  return httpd_resp_send_chunk((httpd_req_t *) ctx, (const char *) buf, len);
+}
+
+static esp_err_t screenshot_get_handler(httpd_req_t *req) {
+  bsp_display_lock(0);
+  lv_obj_t *screen = lv_screen_active();
+  lv_obj_update_layout(screen);
+  int32_t w = lv_obj_get_width(screen);
+  int32_t h = lv_obj_get_height(screen);
+  bsp_display_unlock();
+
+  uint32_t stride = lv_draw_buf_width_to_stride(w, LV_COLOR_FORMAT_RGB888);
+  uint32_t buf_size = stride * h;
+  void *pixel_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+  if (pixel_buf == nullptr) {
+    ESP_LOGE(TAG, "screenshot: OOM (%lu bytes)", (unsigned long) buf_size);
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    return ESP_OK;
+  }
+
+  lv_draw_buf_t snapshot;
+  lv_draw_buf_init(&snapshot, w, h, LV_COLOR_FORMAT_RGB888, stride, pixel_buf, buf_size);
+
+  bsp_display_lock(0);
+  screen = lv_screen_active();
+  lv_result_t snap_res = lv_snapshot_take_to_draw_buf(screen, LV_COLOR_FORMAT_RGB888, &snapshot);
+  bsp_display_unlock();
+
+  if (snap_res != LV_RESULT_OK) {
+    ESP_LOGE(TAG, "screenshot: snapshot failed");
+    heap_caps_free(pixel_buf);
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Snapshot failed");
+    return ESP_OK;
+  }
+
+  // LVGL RGB888 packs bytes B,G,R; swap to R,G,B and drop stride padding in place.
+  uint8_t *dst = (uint8_t *) pixel_buf;
+  const uint8_t *src_row = (const uint8_t *) pixel_buf;
+  for (int32_t y = 0; y < h; y++) {
+    const uint8_t *s = src_row;
+    for (int32_t x = 0; x < w; x++) {
+      uint8_t b = s[0], g = s[1], r = s[2];
+      dst[0] = r;
+      dst[1] = g;
+      dst[2] = b;
+      dst += 3;
+      s += 3;
+    }
+    src_row += stride;
+  }
+
+  httpd_resp_set_type(req, "image/png");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=\"screenshot.png\"");
+
+  int64_t t0 = esp_timer_get_time();
+  esp_err_t ret = png_encode_uncompressed_rgb888((const uint8_t *) pixel_buf, w, h, png_http_write, req);
+  int64_t encode_ms = (esp_timer_get_time() - t0) / 1000;
+  heap_caps_free(pixel_buf);
+
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "screenshot: PNG stream failed: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  httpd_resp_send_chunk(req, nullptr, 0);
+  ESP_LOGI(TAG, "screenshot streamed: %ldx%ld in %ld ms", (long) w, (long) h, (long) encode_ms);
+  return ESP_OK;
+}
+
+void PatioUI::start_screenshot_server_() {
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.server_port = 8080;
+  cfg.ctrl_port = 32080;  // avoid clashing with any other httpd control socket
+  cfg.stack_size = 8192;  // software-render snapshot needs more than the 4KB default
+  cfg.lru_purge_enable = true;
+  httpd_handle_t server = nullptr;
+  if (httpd_start(&server, &cfg) != ESP_OK) {
+    ESP_LOGW(TAG, "screenshot server failed to start");
+    return;
+  }
+  httpd_uri_t uri = {};
+  uri.uri = "/screenshot";
+  uri.method = HTTP_GET;
+  uri.handler = screenshot_get_handler;
+  httpd_register_uri_handler(server, &uri);
+  this->screenshot_httpd_ = server;
+  ESP_LOGI(TAG, "screenshot endpoint at http://<ip>:8080/screenshot");
+}
+
 void PatioUI::setup() {
   ESP_LOGI(TAG, "bringing up Core2 display + LVGL");
 
@@ -444,6 +543,9 @@ void PatioUI::setup() {
   // up/stop/down commands.
 
   ESP_LOGI(TAG, "UI up; heater tile bound to %s", this->timer_entity_.c_str());
+
+  // Live screen capture endpoint (uncompressed PNG on :8080/screenshot).
+  this->start_screenshot_server_();
 }
 
 void PatioUI::loop() {

@@ -85,18 +85,34 @@ After the device is on WiFi, add it to Home Assistant's **ESPHome** integration
 **"Allow the device to perform Home Assistant actions"** on the device so the
 outbound `Open`/`Close`/`Stop`/`Start`/`Stop` service calls work.
 
+## Live screen capture
+
+The component runs a tiny HTTP server on **port 8080** that renders the live
+LVGL framebuffer to an uncompressed PNG (via `lv_snapshot`), handy for UX
+iteration and CI without a physical photo:
+
+```bash
+curl http://<device-ip>:8080/screenshot -o shot.png
+```
+
+It captures whatever tile is currently on screen. Encoding is uncompressed
+(~230 KB for 320×240, <1 s) to keep CPU cost trivial. The PNG encoder
+(`png_uncompressed.c/.h`) is borrowed from the arctic-controller project.
+
 ## Home Assistant contract
 
 - `timer.patio_heaters` + `script.patio_heater_run` (`{minutes}`) +
   `script.patio_heater_stop` for the heater tile.
-- Any four `cover.*` entities for the screen tile (open/close/stop; position
-  optional but used for the `NN%` readout).
+- Any four `cover.*` entities for the screen tile. The screens are driven as
+  Somfy RTS (command-only): the tiles are selectors and the control bar sends
+  momentary up / stop / down commands — no state is read back.
 
 ## Status / TODO
 
 - [x] Smooth native LVGL UI inside ESPHome
 - [x] Heater tile wired to a HA timer (end-to-end verified)
-- [x] Screens tile: perimeter map + select + Open/Close/Stop (HA→device verified)
-- [ ] UX polish (some labels clip; tune sizes/fonts)
+- [x] Screens tile: perimeter map + iconic selectors + up/stop/down (HA→device verified)
+- [x] Live screen-capture PNG endpoint (`:8080/screenshot`)
+- [ ] UX polish (tune sizes/fonts)
 - [ ] Wire the Lights tile
-- [ ] Point screen slots at the real Sun Peaks Caseta screen covers
+- [ ] Point screen slots at the real Sun Peaks Somfy screen covers

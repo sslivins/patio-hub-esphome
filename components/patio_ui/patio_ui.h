@@ -73,6 +73,10 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- display / UI bring-up ---
   void build_ui_();
 
+  // --- live screen capture (uncompressed PNG over HTTP on :8080) ---
+  void start_screenshot_server_();
+  void *screenshot_httpd_{nullptr};  // httpd_handle_t (opaque; kept void* to keep header light)
+
   // --- Home Assistant state subscriptions (run on main/API task) ---
   void on_timer_state_(std::string state);
   void on_timer_remaining_(std::string remaining);
