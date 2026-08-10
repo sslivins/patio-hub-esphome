@@ -76,6 +76,11 @@ patio_ui:
   id: patio_hub_ui
   timer_entity: timer.patio_heaters
   time_id: ha_time
+  # Outside temperature shown on the clock tile. Displayed in °C (the component
+  # converts from °F when the sensor reports Fahrenheit). Currently a Mercer
+  # Island stand-in outdoor sensor; swap to sensor.usl_environmental_temperature_3
+  # once the device's HA can reach the Sun Peaks instance.
+  temp_sensor: sensor.outdoor_kitchen_sensor_temperature
   run_script: script.patio_heater_run
   stop_script: script.patio_heater_stop
   default_minutes: 30

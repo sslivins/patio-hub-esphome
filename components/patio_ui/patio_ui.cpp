@@ -35,6 +35,7 @@ extern "C" const lv_font_t patio_font_countdown;
 #define COL_HEATER lv_color_hex(0x8A4B1E)
 #define COL_LIGHTS lv_color_hex(0x7A6A1E)
 #define COL_SCREENS lv_color_hex(0x1E5A6E)
+#define COL_TIME lv_color_hex(0x1B2A4A)   // clock/temperature lead tile (deep slate blue)
 
 // Heater "nearing expiry" fade: the tile background shifts from the normal
 // brown, through amber, to red over the final EXPIRY_FADE_SECS of the run.
@@ -202,12 +203,17 @@ void PatioUI::build_ui_() {
   lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);  // replaced by page dots below
   this->tv_ = tv;
 
-  lv_obj_t *t_heater = lv_tileview_add_tile(tv, 0, 0, LV_DIR_HOR);
-  lv_obj_t *t_lights = lv_tileview_add_tile(tv, 1, 0, LV_DIR_HOR);
-  lv_obj_t *t_screens = lv_tileview_add_tile(tv, 2, 0, LV_DIR_HOR);
-  this->tiles_[0] = t_heater;
-  this->tiles_[1] = t_lights;
-  this->tiles_[2] = t_screens;
+  lv_obj_t *t_time = lv_tileview_add_tile(tv, 0, 0, LV_DIR_HOR);
+  lv_obj_t *t_heater = lv_tileview_add_tile(tv, 1, 0, LV_DIR_HOR);
+  lv_obj_t *t_lights = lv_tileview_add_tile(tv, 2, 0, LV_DIR_HOR);
+  lv_obj_t *t_screens = lv_tileview_add_tile(tv, 3, 0, LV_DIR_HOR);
+  this->tiles_[TILE_TIME] = t_time;
+  this->tiles_[TILE_HEATER] = t_heater;
+  this->tiles_[TILE_LIGHTS] = t_lights;
+  this->tiles_[TILE_SCREENS] = t_screens;
+
+  // --- clock + outside-temperature tile (the resting/idle screen) ---
+  this->build_time_tile_(t_time);
 
   // --- heater tile (live, wired to HA): iOS-timer style picker ---
   //   idle    : scroll the roller to pick 15/30/45/60 min; Start begins the run
@@ -275,13 +281,13 @@ void PatioUI::build_ui_() {
   // screen so they float over every tile; updated when the active tile changes.
   lv_obj_t *dots = lv_obj_create(scr);
   lv_obj_remove_style_all(dots);
-  lv_obj_set_size(dots, 70, 14);
+  lv_obj_set_size(dots, 90, 14);
   lv_obj_align(dots, LV_ALIGN_BOTTOM_MID, 0, -3);
   lv_obj_set_flex_flow(dots, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(dots, 9, 0);
   lv_obj_clear_flag(dots, LV_OBJ_FLAG_CLICKABLE);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NUM_TILES; i++) {
     lv_obj_t *d = lv_obj_create(dots);
     lv_obj_remove_style_all(d);
     lv_obj_set_size(d, 8, 8);
@@ -307,12 +313,101 @@ void PatioUI::update_page_dots_() {
   if (this->tv_ == nullptr)
     return;
   lv_obj_t *active = lv_tileview_get_tile_active(this->tv_);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NUM_TILES; i++) {
     if (this->page_dots_[i] == nullptr)
       continue;
     bool on = (this->tiles_[i] == active);
     lv_obj_set_style_bg_opa(this->page_dots_[i], on ? LV_OPA_COVER : LV_OPA_40, 0);
   }
+}
+
+// --- clock + outside-temperature tile (the resting screen) ---
+void PatioUI::build_time_tile_(lv_obj_t *tile) {
+  lv_obj_set_style_bg_color(tile, COL_TIME, 0);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+
+  // Quiet header: weekday + date (filled in by refresh_time_tile_).
+  this->time_date_ = make_tile_title(tile, "");
+
+  // Time + AM/PM share one auto-centred row: the AM/PM hangs to the right of the
+  // big digits and the pair stays centred as the clock's width changes.
+  lv_obj_t *row = lv_obj_create(tile);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row, 8, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 56);
+
+  // Large 12-hour clock, reusing the 96px digit+colon font.
+  this->time_big_ = lv_label_create(row);
+  lv_obj_set_style_text_color(this->time_big_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->time_big_, &patio_font_countdown, 0);
+  lv_label_set_text(this->time_big_, "");
+
+  // AM/PM indicator, to the right of and baseline-aligned under the clock.
+  this->time_ampm_ = lv_label_create(row);
+  lv_obj_set_style_text_color(this->time_ampm_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->time_ampm_, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_opa(this->time_ampm_, LV_OPA_80, 0);
+  lv_obj_set_style_pad_bottom(this->time_ampm_, 16, 0);  // lift off the digit descenders
+  lv_label_set_text(this->time_ampm_, "");
+
+  // Outside temperature (displayed in °C) — larger, lifted up from the bottom.
+  this->temp_label_ = lv_label_create(tile);
+  lv_obj_set_style_text_color(this->temp_label_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->temp_label_, &lv_font_montserrat_48, 0);
+  lv_label_set_text(this->temp_label_, "--\u00B0C");
+  lv_obj_align(this->temp_label_, LV_ALIGN_BOTTOM_MID, 0, -40);
+}
+
+// Repaints the clock (12-hour) and outside temperature. LVGL task only.
+void PatioUI::refresh_time_tile_() {
+  if (this->time_big_ != nullptr && this->time_ != nullptr) {
+    auto now = this->time_->now();
+    if (now.is_valid()) {
+      int h12 = now.hour % 12;
+      if (h12 == 0)
+        h12 = 12;
+      char tb[8];
+      snprintf(tb, sizeof(tb), "%d:%02d", h12, now.minute);
+      lv_label_set_text(this->time_big_, tb);
+      lv_label_set_text(this->time_ampm_, now.hour < 12 ? "AM" : "PM");
+      char db[32];
+      now.strftime(db, sizeof(db), "%a %b %d");
+      lv_label_set_text(this->time_date_, db);
+    }
+  }
+  if (this->temp_label_ != nullptr && this->temp_dirty_.exchange(false)) {
+    if (this->temp_valid_.load()) {
+      float c = this->outside_temp_raw_.load();
+      if (this->temp_is_f_.load())
+        c = (c - 32.0f) * 5.0f / 9.0f;
+      char cb[24];
+      snprintf(cb, sizeof(cb), "%.1f\u00B0C", c);
+      lv_label_set_text(this->temp_label_, cb);
+    } else {
+      lv_label_set_text(this->temp_label_, "--\u00B0C");
+    }
+  }
+}
+
+// After IDLE_REVERT_MS with no touch, drift back to the clock tile — unless a
+// heater timer is running, in which case rest on the heater/countdown tile so
+// the remaining time stays visible. LVGL task only.
+void PatioUI::maybe_auto_revert_() {
+  if (this->tv_ == nullptr)
+    return;
+  if (lv_display_get_inactive_time(nullptr) < IDLE_REVERT_MS)
+    return;
+  int target = this->active_.load() ? TILE_HEATER : TILE_TIME;
+  if (this->tiles_[target] == nullptr)
+    return;
+  if (lv_tileview_get_tile_active(this->tv_) == this->tiles_[target])
+    return;
+  lv_tileview_set_tile(this->tv_, this->tiles_[target], LV_ANIM_ON);
+  this->update_page_dots_();
 }
 
 // ---------------- public request API (called from LVGL task) ----------------
@@ -390,7 +485,7 @@ void PatioUI::tick_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user
 void PatioUI::flash_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user_data(t))->flash_tick_(); }
 
 void PatioUI::flash_tick_() {
-  if (this->heater_value_ == nullptr || this->tiles_[0] == nullptr)
+  if (this->heater_value_ == nullptr || this->tiles_[TILE_HEATER] == nullptr)
     return;
   int s = this->countdown_secs_.load();
   bool in_window = this->active_.load() && s > 0 && s <= EXPIRY_FLASH_SECS;
@@ -398,7 +493,7 @@ void PatioUI::flash_tick_() {
     this->flash_on_ = !this->flash_on_;
     lv_color_t bg = this->flash_on_ ? lv_color_white() : COL_FLASH;
     lv_color_t fg = this->flash_on_ ? COL_FLASH : lv_color_white();
-    lv_obj_set_style_bg_color(this->tiles_[0], bg, 0);
+    lv_obj_set_style_bg_color(this->tiles_[TILE_HEATER], bg, 0);
     lv_obj_set_style_text_color(this->heater_value_, fg, 0);
     this->flashing_ = true;
   } else if (this->flashing_) {
@@ -439,6 +534,9 @@ void PatioUI::tick_() {
     this->refresh_heater_ui_();
   if (this->light_ui_dirty_.exchange(false))
     this->refresh_lights_ui_();
+  // Clock tile refresh + idle auto-revert (both LVGL-task safe).
+  this->refresh_time_tile_();
+  this->maybe_auto_revert_();
 }
 
 // Redraw the timer tile for the current state (LVGL task).
@@ -465,9 +563,9 @@ void PatioUI::refresh_heater_ui_() {
   // Nearing-expiry indicator: fade the tile background brown->amber->red over
   // the final EXPIRY_FADE_SECS. Normal brown while idle or with time to spare.
   // While the final-seconds flasher owns the tile, leave the background alone.
-  if (this->tiles_[0] != nullptr && !this->flashing_) {
+  if (this->tiles_[TILE_HEATER] != nullptr && !this->flashing_) {
     lv_color_t bg = active ? heater_bg_for_remaining(this->countdown_secs_.load()) : COL_HEATER;
-    lv_obj_set_style_bg_color(this->tiles_[0], bg, 0);
+    lv_obj_set_style_bg_color(this->tiles_[TILE_HEATER], bg, 0);
   }
 
   // Toggle picker vs countdown.
@@ -894,6 +992,37 @@ void PatioUI::on_light_bright_(std::string entity_id, std::string brightness) {
   ESP_LOGD(TAG, "light[%d] brightness %d/255 (%d%%)", idx, b255, pct);
 }
 
+// Outside temperature for the clock tile. Stored in the sensor's native unit;
+// converted to °C at display time (see refresh_time_tile_). Empty / "unknown" /
+// "unavailable" mark it invalid so the label shows a placeholder.
+void PatioUI::on_outside_temp_(std::string state) {
+  if (state.empty() || state == "unknown" || state == "unavailable" || state == "None") {
+    this->temp_valid_.store(false);
+    this->temp_dirty_.store(true);
+    ESP_LOGD(TAG, "outside temp: %s (invalid)", state.c_str());
+    return;
+  }
+  char *end = nullptr;
+  float v = strtof(state.c_str(), &end);
+  if (end == state.c_str()) {  // not a number
+    this->temp_valid_.store(false);
+  } else {
+    this->outside_temp_raw_.store(v);
+    this->temp_valid_.store(true);
+  }
+  this->temp_dirty_.store(true);
+  ESP_LOGD(TAG, "outside temp: %s", state.c_str());
+}
+
+// Native unit of the temperature sensor. If it's Fahrenheit we convert to °C
+// for display; anything else is assumed already Celsius.
+void PatioUI::on_temp_unit_(std::string unit) {
+  bool is_f = (unit.find('F') != std::string::npos);
+  this->temp_is_f_.store(is_f);
+  this->temp_dirty_.store(true);
+  ESP_LOGD(TAG, "outside temp unit: %s (%s)", unit.c_str(), is_f ? "F->C" : "C");
+}
+
 // ---------------- ESPHome Component ----------------
 // ---------------- screenshot HTTP endpoint ----------------
 // Grab the live LVGL framebuffer and stream it as an uncompressed PNG, mirroring
@@ -1100,10 +1229,23 @@ void PatioUI::setup() {
     }
   }
 
+  // If a timer is already running at boot, rest on the heater tile so the
+  // countdown is visible immediately (otherwise start on the clock tile).
+  if (this->active_.load() && this->tv_ != nullptr) {
+    bsp_display_lock(0);
+    lv_tileview_set_tile(this->tv_, this->tiles_[TILE_HEATER], LV_ANIM_OFF);
+    this->update_page_dots_();
+    bsp_display_unlock();
+  }
+
   // Subscribe to the HA timer (api is a hard dependency, so global_api_server is up).
   this->subscribe_homeassistant_state(&PatioUI::on_timer_state_, this->timer_entity_);
   this->subscribe_homeassistant_state(&PatioUI::on_timer_remaining_, this->timer_entity_, "remaining");
   this->subscribe_homeassistant_state(&PatioUI::on_timer_finishes_at_, this->timer_entity_, "finishes_at");
+
+  // Clock-tile outside temperature (converted to °C for display; see on_temp_unit_).
+  this->subscribe_homeassistant_state(&PatioUI::on_outside_temp_, this->temp_sensor_);
+  this->subscribe_homeassistant_state(&PatioUI::on_temp_unit_, this->temp_sensor_, "unit_of_measurement");
 
   // Screens are Somfy RTS (command-only, no reliable state feedback), so we
   // don't subscribe to their state — the tiles are selectors + momentary

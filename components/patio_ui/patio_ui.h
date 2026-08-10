@@ -41,10 +41,21 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   float get_setup_priority() const override { return setup_priority::LATE; }
   void dump_config() override;
 
+  // Swipeable tile order (a clock/temperature tile leads, then the controls).
+  static constexpr int TILE_TIME = 0;
+  static constexpr int TILE_HEATER = 1;
+  static constexpr int TILE_LIGHTS = 2;
+  static constexpr int TILE_SCREENS = 3;
+  static constexpr int NUM_TILES = 4;
+  // Revert to the clock tile (or the heater tile if a timer is running) after
+  // this much untouched time.
+  static constexpr uint32_t IDLE_REVERT_MS = 60000;
+
   // YAML-configurable Home Assistant contract.
   void set_run_script(const std::string &s) { this->run_script_ = s; }
   void set_stop_script(const std::string &s) { this->stop_script_ = s; }
   void set_timer_entity(const std::string &s) { this->timer_entity_ = s; }
+  void set_temp_sensor(const std::string &s) { this->temp_sensor_ = s; }
   void set_time(time::RealTimeClock *t) { this->time_ = t; }
   void set_default_minutes(int m) {
     this->default_minutes_ = m;
@@ -111,6 +122,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void on_timer_finishes_at_(std::string finishes_at);  // absolute UTC end time
   void on_light_state_(std::string entity_id, std::string state);       // "on"/"off"
   void on_light_bright_(std::string entity_id, std::string brightness);  // 0..255
+  void on_outside_temp_(std::string state);                              // clock-tile temperature
+  void on_temp_unit_(std::string unit);                                  // temp sensor's unit (°C/°F)
   int light_index_for_entity_(const std::string &entity_id) const;
 
   // --- LVGL-task helpers ---
@@ -119,6 +132,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   static void flash_cb_(lv_timer_t *t);
   void flash_tick_();         // fast red/white flash in the final seconds, LVGL task
   void refresh_heater_ui_();  // LVGL task only — dial value/sub + arc
+  void build_time_tile_(lv_obj_t *tile);     // LVGL task only
+  void refresh_time_tile_();                 // LVGL task only — clock + temperature
+  void maybe_auto_revert_();                 // LVGL task only — idle -> clock/heater tile
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
   void update_screen_visual_();              // LVGL task only
   void build_lights_tile_(lv_obj_t *tile);   // LVGL task only
@@ -128,6 +144,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::string run_script_{"script.patio_heater_run"};
   std::string stop_script_{"script.patio_heater_stop"};
   std::string timer_entity_{"timer.patio_heaters"};
+  std::string temp_sensor_{"sensor.usl_environmental_temperature_3"};
   time::RealTimeClock *time_{nullptr};
   int min_minutes_{5};
   int max_minutes_{480};
@@ -145,8 +162,14 @@ class PatioUI : public Component, public api::CustomAPIDevice {
 
   // tileview + bottom page-position dots (LVGL task only)
   lv_obj_t *tv_{nullptr};
-  lv_obj_t *tiles_[3]{};
-  lv_obj_t *page_dots_[3]{};
+  lv_obj_t *tiles_[NUM_TILES]{};
+  lv_obj_t *page_dots_[NUM_TILES]{};
+
+  // clock/temperature tile widgets (LVGL task only)
+  lv_obj_t *time_date_{nullptr};   // small header: weekday + date
+  lv_obj_t *time_big_{nullptr};    // large 12-hour H:MM
+  lv_obj_t *time_ampm_{nullptr};   // AM/PM
+  lv_obj_t *temp_label_{nullptr};  // outside temperature (°C)
 
   // screen tile widgets (LVGL task only)
   lv_obj_t *screen_btn_[NUM_SCREENS]{};
@@ -204,6 +227,12 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::atomic<bool> light_ui_dirty_{false};            // HA changed -> refresh sliders
   std::atomic<int> pending_light_bright_[NUM_LIGHTS];  // -1 none, else 0..100 to send
   std::atomic<bool> pending_light_toggle_[NUM_LIGHTS]; // request on/off toggle
+
+  // clock tile: outside temperature pushed from HA.
+  std::atomic<float> outside_temp_raw_{0.0f};  // value in the sensor's native unit
+  std::atomic<bool> temp_is_f_{false};    // native unit is °F -> convert to °C for display
+  std::atomic<bool> temp_valid_{false};   // false until a numeric value arrives
+  std::atomic<bool> temp_dirty_{true};    // HA changed -> refresh the label
 };
 
 }  // namespace patio_ui

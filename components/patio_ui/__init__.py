@@ -9,6 +9,7 @@ DEPENDENCIES = ["esp32", "api", "time"]
 CONF_RUN_SCRIPT = "run_script"
 CONF_STOP_SCRIPT = "stop_script"
 CONF_TIMER_ENTITY = "timer_entity"
+CONF_TEMP_SENSOR = "temp_sensor"
 CONF_DEFAULT_MINUTES = "default_minutes"
 CONF_MIN_MINUTES = "min_minutes"
 CONF_MAX_MINUTES = "max_minutes"
@@ -73,6 +74,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_RUN_SCRIPT, default="script.patio_heater_run"): cv.string,
         cv.Optional(CONF_STOP_SCRIPT, default="script.patio_heater_stop"): cv.string,
         cv.Optional(CONF_TIMER_ENTITY, default="timer.patio_heaters"): cv.string,
+        cv.Optional(
+            CONF_TEMP_SENSOR, default="sensor.usl_environmental_temperature_3"
+        ): cv.string,
         cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
         cv.Optional(CONF_DEFAULT_MINUTES, default=30): cv.int_range(min=1, max=1440),
         cv.Optional(CONF_MIN_MINUTES, default=5): cv.int_range(min=1, max=1440),
@@ -94,6 +98,7 @@ async def to_code(config):
     cg.add(var.set_run_script(config[CONF_RUN_SCRIPT]))
     cg.add(var.set_stop_script(config[CONF_STOP_SCRIPT]))
     cg.add(var.set_timer_entity(config[CONF_TIMER_ENTITY]))
+    cg.add(var.set_temp_sensor(config[CONF_TEMP_SENSOR]))
     if CONF_TIME_ID in config:
         cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))
     cg.add(var.set_default_minutes(config[CONF_DEFAULT_MINUTES]))
