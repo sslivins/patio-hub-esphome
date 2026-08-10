@@ -332,11 +332,26 @@ void PatioUI::request_extend(int add_min) {
 void PatioUI::tick_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user_data(t))->tick_(); }
 
 void PatioUI::tick_() {
-  // local 1 Hz countdown while active
+  // Countdown while active. Prefer the absolute finish time (authoritative and
+  // self-correcting across reboots); fall back to a local 1 Hz decrement until
+  // the finish time and a valid clock are both available.
   if (this->active_.load()) {
-    int s = this->countdown_secs_.load();
-    if (s > 0) {
-      this->countdown_secs_.store(s - 1);
+    long fin = this->finishes_at_epoch_.load();
+    bool derived = false;
+    if (fin > 0 && this->time_ != nullptr) {
+      auto now = this->time_->now();
+      if (now.is_valid()) {
+        long rem = fin - static_cast<long>(now.timestamp);
+        if (rem < 0)
+          rem = 0;
+        this->countdown_secs_.store(static_cast<int>(rem));
+        derived = true;
+      }
+    }
+    if (!derived) {
+      int s = this->countdown_secs_.load();
+      if (s > 0)
+        this->countdown_secs_.store(s - 1);
     }
     this->label_dirty_.store(true);
   }
@@ -673,19 +688,47 @@ void PatioUI::request_cover_action(int action) {
 void PatioUI::on_timer_state_(std::string state) {
   bool active = (state == "active");
   this->active_.store(active);
-  if (!active)
+  if (!active) {
     this->countdown_secs_.store(-1);
+    this->finishes_at_epoch_.store(0);
+  }
   this->label_dirty_.store(true);
   ESP_LOGD(TAG, "timer state: %s", state.c_str());
 }
 
 void PatioUI::on_timer_remaining_(std::string remaining) {
-  // "H:MM:SS" -> seconds
+  // "H:MM:SS" -> seconds. NOTE: HA freezes this value while the timer runs, so
+  // it only seeds an approximate countdown until on_timer_finishes_at_ + a valid
+  // clock take over (see tick_()).
   int h = 0, m = 0, s = 0;
   if (sscanf(remaining.c_str(), "%d:%d:%d", &h, &m, &s) == 3) {
     this->countdown_secs_.store(h * 3600 + m * 60 + s);
     this->label_dirty_.store(true);
     ESP_LOGD(TAG, "timer remaining: %s (%d s)", remaining.c_str(), h * 3600 + m * 60 + s);
+  }
+}
+
+void PatioUI::on_timer_finishes_at_(std::string finishes_at) {
+  // Absolute UTC ISO-8601, e.g. "2026-08-10T17:45:00+00:00". HA always sends
+  // this in UTC, so parse the wall-clock fields and convert with timegm().
+  if (finishes_at.empty() || finishes_at == "None" || finishes_at == "unknown") {
+    this->finishes_at_epoch_.store(0);
+    return;
+  }
+  int yr = 0, mo = 0, dy = 0, hr = 0, mi = 0, se = 0;
+  if (sscanf(finishes_at.c_str(), "%d-%d-%dT%d:%d:%d", &yr, &mo, &dy, &hr, &mi, &se) == 6) {
+    // Days since the Unix epoch for this UTC calendar date (Howard Hinnant's
+    // civil-from-days algorithm). Avoids timegm(), which ESP-IDF's newlib lacks.
+    int y = yr - (mo <= 2 ? 1 : 0);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = static_cast<unsigned>(y - era * 400);
+    unsigned doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + dy - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = static_cast<long>(era) * 146097 + static_cast<long>(doe) - 719468;
+    long epoch = days * 86400L + hr * 3600L + mi * 60L + se;
+    this->finishes_at_epoch_.store(epoch);
+    this->label_dirty_.store(true);
+    ESP_LOGD(TAG, "timer finishes_at: %s (%ld)", finishes_at.c_str(), epoch);
   }
 }
 
@@ -907,6 +950,7 @@ void PatioUI::setup() {
   // Subscribe to the HA timer (api is a hard dependency, so global_api_server is up).
   this->subscribe_homeassistant_state(&PatioUI::on_timer_state_, this->timer_entity_);
   this->subscribe_homeassistant_state(&PatioUI::on_timer_remaining_, this->timer_entity_, "remaining");
+  this->subscribe_homeassistant_state(&PatioUI::on_timer_finishes_at_, this->timer_entity_, "finishes_at");
 
   // Screens are Somfy RTS (command-only, no reliable state feedback), so we
   // don't subscribe to their state — the tiles are selectors + momentary

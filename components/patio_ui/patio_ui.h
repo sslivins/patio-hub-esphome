@@ -15,6 +15,7 @@ struct _lv_timer_t;
 typedef struct _lv_timer_t lv_timer_t;
 
 #include "esphome/components/api/custom_api_device.h"
+#include "esphome/components/time/real_time_clock.h"
 
 namespace esphome {
 namespace patio_ui {
@@ -43,6 +44,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void set_run_script(const std::string &s) { this->run_script_ = s; }
   void set_stop_script(const std::string &s) { this->stop_script_ = s; }
   void set_timer_entity(const std::string &s) { this->timer_entity_ = s; }
+  void set_time(time::RealTimeClock *t) { this->time_ = t; }
   void set_default_minutes(int m) { this->setpoint_minutes_ = m; }
   void set_min_minutes(int m) { this->min_minutes_ = m; }
   void set_max_minutes(int m) { this->max_minutes_ = m; }
@@ -102,6 +104,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- Home Assistant state subscriptions (run on main/API task) ---
   void on_timer_state_(std::string state);
   void on_timer_remaining_(std::string remaining);
+  void on_timer_finishes_at_(std::string finishes_at);  // absolute UTC end time
   void on_light_state_(std::string entity_id, std::string state);       // "on"/"off"
   void on_light_bright_(std::string entity_id, std::string brightness);  // 0..255
   int light_index_for_entity_(const std::string &entity_id) const;
@@ -119,6 +122,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::string run_script_{"script.patio_heater_run"};
   std::string stop_script_{"script.patio_heater_stop"};
   std::string timer_entity_{"timer.patio_heaters"};
+  time::RealTimeClock *time_{nullptr};
   int min_minutes_{5};
   int max_minutes_{480};
 
@@ -162,6 +166,11 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- cross-task state (atomics) ---
   std::atomic<int> setpoint_minutes_{30};     // desired run length
   std::atomic<int> countdown_secs_{-1};       // remaining secs when active, else -1
+  // Absolute UTC epoch the active HA timer finishes at (0 = unknown). When set
+  // and the device clock is valid, the countdown is derived from this each tick
+  // so a mid-run reboot resumes at the true remaining time (HA's `remaining`
+  // attribute is frozen while running; only `finishes_at` is accurate).
+  std::atomic<long> finishes_at_epoch_{0};
   std::atomic<bool> active_{false};           // HA timer is running
   std::atomic<int> pending_start_{-1};        // minutes to start, -1 = none
   std::atomic<int> pending_extend_secs_{-1};  // new total secs for timer.start, -1 = none

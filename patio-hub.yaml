@@ -65,10 +65,17 @@ ota:
   - platform: esphome
     password: !secret core2_patio_ota_password
 
+# Device clock, synced from Home Assistant (single source of truth — same clock
+# as the timer's `finishes_at`, LAN-reliable at the remote site).
+time:
+  - platform: homeassistant
+    id: ha_time
+
 # The native-LVGL patio UI + Home Assistant heater-timer bridge.
 patio_ui:
   id: patio_hub_ui
   timer_entity: timer.patio_heaters
+  time_id: ha_time
   run_script: script.patio_heater_run
   stop_script: script.patio_heater_stop
   default_minutes: 30
