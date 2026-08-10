@@ -116,19 +116,13 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- LVGL-task helpers ---
   static void tick_cb_(lv_timer_t *t);
   void tick_();               // 1 Hz, LVGL task
+  static void flash_cb_(lv_timer_t *t);
+  void flash_tick_();         // fast red/white flash in the final seconds, LVGL task
   void refresh_heater_ui_();  // LVGL task only — dial value/sub + arc
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
   void update_screen_visual_();              // LVGL task only
   void build_lights_tile_(lv_obj_t *tile);   // LVGL task only
   void refresh_lights_ui_();                 // LVGL task only
-
-  // --- audio (chime near expiry) ---
-  void audio_setup_();                         // init I2S speaker codec + play task
-  static void audio_task_trampoline_(void *arg);
-  void audio_task_run_();                      // dedicated task: blocks until signalled
-  void play_chime_(int type);                  // 1 = per-minute, 2 = finish (blocking)
-  void play_tone_(int freq_hz, int ms, float gain);  // one enveloped sine tone
-  void request_chime_(int type);               // signal the audio task (non-blocking)
 
   // --- config ---
   std::string run_script_{"script.patio_heater_run"};
@@ -145,6 +139,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   lv_obj_t *heater_btn_right_{nullptr};   // Start / +15 min
   lv_obj_t *heater_btn_right_lbl_{nullptr};
   lv_timer_t *tick_timer_{nullptr};
+  lv_timer_t *flash_timer_{nullptr};   // final-seconds red/white flasher
+  bool flash_on_{false};               // current flash phase (LVGL task only)
+  bool flashing_{false};               // true while the flasher owns the tile
 
   // tileview + bottom page-position dots (LVGL task only)
   lv_obj_t *tv_{nullptr};
@@ -189,12 +186,6 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // of waiting ~30 s for HA to reconnect and re-push the timer state.
   ESPPreferenceObject finishes_pref_;
   void persist_finishes_at_(long epoch);
-
-  // --- audio state ---
-  void *spk_codec_{nullptr};                  // esp_codec_dev_handle_t (opaque here)
-  void *audio_task_{nullptr};                 // FreeRTOS TaskHandle_t (opaque here)
-  std::atomic<int> pending_chime_{0};         // 1 = per-minute, 2 = finish, 0 = none
-  int prev_remaining_{-1};                     // LVGL-task-only: last tick's remaining, for edge detection
   std::atomic<bool> active_{false};           // HA timer is running
   std::atomic<int> pending_start_{-1};        // minutes to start, -1 = none
   std::atomic<int> pending_extend_secs_{-1};  // new total secs for timer.start, -1 = none

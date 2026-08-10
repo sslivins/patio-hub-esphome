@@ -7,7 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "bsp/esp-bsp.h"
-#include "esp_codec_dev.h"
+#include "driver/i2c_master.h"
 #include "lvgl.h"
 
 #include "esp_http_server.h"
@@ -21,7 +21,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 
 namespace esphome {
 namespace patio_ui {
@@ -42,6 +41,8 @@ extern "C" const lv_font_t patio_font_countdown;
 #define COL_HEATER_AMBER lv_color_hex(0xC46A12)
 #define COL_HEATER_RED lv_color_hex(0xB01E10)
 static const int EXPIRY_FADE_SECS = 300;  // start fading in the last 5 minutes
+static const int EXPIRY_FLASH_SECS = 10;  // hard red/white flash in the last 10 s
+#define COL_FLASH lv_color_hex(0xF5121A)   // vivid red for the flash
 
 // Linear blend of two RGB colours. f=0 -> a, f=1 -> b.
 static lv_color_t lerp_color(lv_color_t a, lv_color_t b, float f) {
@@ -296,6 +297,8 @@ void PatioUI::build_ui_() {
 
   // 1 Hz refresh/countdown driver (LVGL task)
   this->tick_timer_ = lv_timer_create(PatioUI::tick_cb_, 1000, this);
+  // Fast red/white flash driver for the final EXPIRY_FLASH_SECS (LVGL task).
+  this->flash_timer_ = lv_timer_create(PatioUI::flash_cb_, 350, this);
   this->refresh_heater_ui_();
 }
 
@@ -380,6 +383,34 @@ void PatioUI::request_extend(int add_min) {
 // ---------------- LVGL-task label rendering ----------------
 void PatioUI::tick_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user_data(t))->tick_(); }
 
+// Fast flasher: in the final EXPIRY_FLASH_SECS, alternate the heater tile
+// between vivid red and white (with inverted countdown text) for maximum
+// "get up and check the heaters" visibility. Outside that window it restores
+// the normal look exactly once, then stays out of the way.
+void PatioUI::flash_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user_data(t))->flash_tick_(); }
+
+void PatioUI::flash_tick_() {
+  if (this->heater_value_ == nullptr || this->tiles_[0] == nullptr)
+    return;
+  int s = this->countdown_secs_.load();
+  bool in_window = this->active_.load() && s > 0 && s <= EXPIRY_FLASH_SECS;
+  if (in_window) {
+    this->flash_on_ = !this->flash_on_;
+    lv_color_t bg = this->flash_on_ ? lv_color_white() : COL_FLASH;
+    lv_color_t fg = this->flash_on_ ? COL_FLASH : lv_color_white();
+    lv_obj_set_style_bg_color(this->tiles_[0], bg, 0);
+    lv_obj_set_style_text_color(this->heater_value_, fg, 0);
+    this->flashing_ = true;
+  } else if (this->flashing_) {
+    // Leaving the flash window — restore normal text colour and let the next
+    // refresh repaint the proper (faded/brown) tile background.
+    this->flashing_ = false;
+    this->flash_on_ = false;
+    lv_obj_set_style_text_color(this->heater_value_, lv_color_white(), 0);
+    this->label_dirty_.store(true);
+  }
+}
+
 void PatioUI::tick_() {
   // Countdown while active. Prefer the absolute finish time (authoritative and
   // self-correcting across reboots); fall back to a local 1 Hz decrement until
@@ -402,22 +433,7 @@ void PatioUI::tick_() {
       if (s > 0)
         this->countdown_secs_.store(s - 1);
     }
-    // Audible warnings as we approach expiry. Detect downward threshold
-    // crossings against the previous tick so a 1 s sample gap can't skip one.
-    int cur = this->countdown_secs_.load();
-    if (this->prev_remaining_ >= 0) {
-      if (this->prev_remaining_ > 0 && cur <= 0) {
-        this->request_chime_(2);  // finished — distinct longer chime
-      } else if (this->prev_remaining_ > 120 && cur <= 120) {
-        this->request_chime_(1);  // 2 minutes left
-      } else if (this->prev_remaining_ > 60 && cur <= 60) {
-        this->request_chime_(1);  // 1 minute left
-      }
-    }
-    this->prev_remaining_ = cur;
     this->label_dirty_.store(true);
-  } else {
-    this->prev_remaining_ = -1;  // re-arm crossings for the next run
   }
   if (this->label_dirty_.exchange(false))
     this->refresh_heater_ui_();
@@ -448,7 +464,8 @@ void PatioUI::refresh_heater_ui_() {
 
   // Nearing-expiry indicator: fade the tile background brown->amber->red over
   // the final EXPIRY_FADE_SECS. Normal brown while idle or with time to spare.
-  if (this->tiles_[0] != nullptr) {
+  // While the final-seconds flasher owns the tile, leave the background alone.
+  if (this->tiles_[0] != nullptr && !this->flashing_) {
     lv_color_t bg = active ? heater_bg_for_remaining(this->countdown_secs_.load()) : COL_HEATER;
     lv_obj_set_style_bg_color(this->tiles_[0], bg, 0);
   }
@@ -764,108 +781,6 @@ void PatioUI::request_cover_action(int action) {
   this->pending_cover_action_.store(action);
 }
 
-// ---------------- audio: expiry chimes ----------------
-// The Core2 has an onboard NS4168 I2S speaker. Audio writes are blocking, so we
-// never play on the LVGL/main task (it would stall the display flush). tick_()
-// only sets an atomic + notifies this dedicated task, which renders and plays.
-static constexpr int CHIME_SR = 22050;  // BSP default: 22.05 kHz mono 16-bit
-
-void PatioUI::audio_setup_() {
-  if (bsp_audio_init(nullptr) != ESP_OK) {
-    ESP_LOGW(TAG, "bsp_audio_init failed; chimes disabled");
-    return;
-  }
-  esp_codec_dev_handle_t spk = bsp_audio_codec_speaker_init();
-  if (spk == nullptr) {
-    ESP_LOGW(TAG, "speaker codec init failed; chimes disabled");
-    return;
-  }
-  esp_codec_dev_set_out_vol(spk, 80);
-  this->spk_codec_ = spk;
-
-  TaskHandle_t h = nullptr;
-  if (xTaskCreate(&PatioUI::audio_task_trampoline_, "patio_chime", 6144, this, 5, &h) != pdPASS) {
-    ESP_LOGW(TAG, "chime task create failed; chimes disabled");
-    this->spk_codec_ = nullptr;
-    return;
-  }
-  this->audio_task_ = h;
-  ESP_LOGI(TAG, "audio ready; expiry chimes enabled");
-}
-
-void PatioUI::audio_task_trampoline_(void *arg) { static_cast<PatioUI *>(arg)->audio_task_run_(); }
-
-void PatioUI::audio_task_run_() {
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    int type = this->pending_chime_.exchange(0);
-    if (type > 0)
-      this->play_chime_(type);
-  }
-}
-
-// Signal the player from any task (non-blocking). Safe to call from tick_().
-void PatioUI::request_chime_(int type) {
-  if (this->spk_codec_ == nullptr || this->audio_task_ == nullptr)
-    return;
-  this->pending_chime_.store(type);
-  xTaskNotifyGive(static_cast<TaskHandle_t>(this->audio_task_));
-}
-
-// Render one enveloped sine tone and write it to the speaker (blocking). The
-// short linear attack/release avoids the click a bare square-edged buffer makes.
-void PatioUI::play_tone_(int freq_hz, int ms, float gain) {
-  esp_codec_dev_handle_t spk = static_cast<esp_codec_dev_handle_t>(this->spk_codec_);
-  if (spk == nullptr || ms <= 0)
-    return;
-  int n = CHIME_SR * ms / 1000;
-  int16_t *buf = static_cast<int16_t *>(malloc(sizeof(int16_t) * n));
-  if (buf == nullptr)
-    return;
-  int env = CHIME_SR * 5 / 1000;  // 5 ms attack/release
-  if (env * 2 > n)
-    env = n / 2;
-  const float amp = gain * 26000.0f;
-  const float w = 2.0f * static_cast<float>(M_PI) * freq_hz / CHIME_SR;
-  for (int i = 0; i < n; i++) {
-    float e = 1.0f;
-    if (i < env)
-      e = static_cast<float>(i) / env;
-    else if (i >= n - env)
-      e = static_cast<float>(n - i) / env;
-    buf[i] = static_cast<int16_t>(amp * e * sinf(w * i));
-  }
-  esp_codec_dev_write(spk, buf, sizeof(int16_t) * n);
-  free(buf);
-}
-
-// type 1 = per-minute warning (short two-note rising ding).
-// type 2 = finished (longer three-note rising arpeggio, then a held note).
-void PatioUI::play_chime_(int type) {
-  esp_codec_dev_handle_t spk = static_cast<esp_codec_dev_handle_t>(this->spk_codec_);
-  if (spk == nullptr)
-    return;
-  esp_codec_dev_sample_info_t fs = {};
-  fs.bits_per_sample = 16;
-  fs.channel = 1;
-  fs.sample_rate = CHIME_SR;
-  if (esp_codec_dev_open(spk, &fs) != ESP_OK) {
-    ESP_LOGW(TAG, "codec open failed; skipping chime");
-    return;
-  }
-  if (type == 2) {
-    this->play_tone_(1047, 150, 0.9f);  // C6
-    this->play_tone_(1319, 150, 0.9f);  // E6
-    this->play_tone_(1568, 150, 0.9f);  // G6
-    this->play_tone_(0, 80, 0.0f);      // brief gap (silence)
-    this->play_tone_(1568, 320, 0.9f);  // held G6
-  } else {
-    this->play_tone_(1047, 120, 0.8f);  // C6
-    this->play_tone_(1319, 150, 0.8f);  // E6
-  }
-  esp_codec_dev_close(spk);
-}
-
 // ---------------- Home Assistant state callbacks (main/API task) ----------------
 void PatioUI::persist_finishes_at_(long epoch) {
   this->finishes_pref_.save(&epoch);
@@ -1135,6 +1050,28 @@ void PatioUI::setup() {
   bsp_display_backlight_on();
   bsp_display_brightness_set(80);
 
+  // Silence the AXP2101 charge-indicator LED — the blue light that blinks at
+  // 1 Hz on the side of the case. The BSP programs CHGLED (reg 0x69) to the
+  // "1 Hz blink" mode (0b00010011); overwrite it with 0x00 (manual, output
+  // off) over the BSP's shared I2C bus so the indicator stays dark. This only
+  // touches the LED control register, not charging behaviour.
+  {
+    i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
+    if (i2c_bus != nullptr) {
+      i2c_device_config_t axp_cfg = {};
+      axp_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+      axp_cfg.device_address = 0x34;  // AXP2101
+      axp_cfg.scl_speed_hz = 100000;
+      i2c_master_dev_handle_t axp = nullptr;
+      if (i2c_master_bus_add_device(i2c_bus, &axp_cfg, &axp) == ESP_OK) {
+        const uint8_t chgled_off[] = {0x69, 0x00};
+        if (i2c_master_transmit(axp, chgled_off, sizeof(chgled_off), 1000) != ESP_OK)
+          ESP_LOGW(TAG, "failed to disable CHGLED");
+        i2c_master_bus_rm_device(axp);
+      }
+    }
+  }
+
   bsp_display_lock(0);
   this->build_ui_();
   bsp_display_unlock();
@@ -1187,9 +1124,6 @@ void PatioUI::setup() {
   this->light_ui_dirty_.store(true);
 
   ESP_LOGI(TAG, "UI up; heater tile bound to %s", this->timer_entity_.c_str());
-
-  // Bring up the onboard speaker + background player for expiry chimes.
-  this->audio_setup_();
 
   // Live screen capture endpoint (uncompressed PNG on :8080/screenshot).
   this->start_screenshot_server_();
