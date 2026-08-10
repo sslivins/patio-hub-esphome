@@ -79,6 +79,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // Light intents (called from the LVGL task; only touch atomics).
   void request_light_brightness(int idx, int pct);  // 0..100 (0 => off)
   void request_light_toggle(int idx);
+  void update_light_fill_(int i, int value, bool on);  // LVGL task — size the peach fill layer
 
   // Binds a light index to its LVGL slider / name-tap callbacks.
   struct LightCtrl {
@@ -135,6 +136,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // light tile widgets (LVGL task only)
   lv_obj_t *light_slider_[NUM_LIGHTS]{};
   lv_obj_t *light_name_[NUM_LIGHTS]{};
+  lv_obj_t *light_fill_[NUM_LIGHTS]{};   // manual peach fill layer (reaches track bottom)
 
   // --- screen config / selection ---
   std::string screen_entity_[NUM_SCREENS];

@@ -76,6 +76,11 @@ static void ev_light_toggle(lv_event_t *e) {  // tap group name -> toggle on/off
   auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
   c->self->request_light_toggle(c->idx);
 }
+static void ev_light_dragging(lv_event_t *e) {  // fader value changing -> resize peach fill
+  auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
+  int v = lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e)));
+  c->self->update_light_fill_(c->idx, v, v > 0);
+}
 
 static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb, void *user) {
   lv_obj_t *btn = lv_button_create(parent);
@@ -429,26 +434,52 @@ void PatioUI::build_lights_tile_(lv_obj_t *tile) {
       lv_obj_add_event_cb(name, ev_light_toggle, LV_EVENT_CLICKED, &this->light_ctrl_[i]);
     }
 
-    // vertical dim fader. Knob-only interaction (ADV_HITTEST): you grab the
-    // white knob and drag it; pressing the bare track does nothing. The knob is
-    // a thin, wide pill. LV_PART_MAIN top/bottom padding (== half the knob
-    // height) insets the indicator travel so the knob is CLAMPED inside the
-    // track rectangle at both extremes: at value 0 its bottom sits exactly on
-    // the track bottom, never dipping into the page-dot strip / bottom-edge
-    // swipe zone (which was stealing the grab). At value 100 its top sits on
-    // the track top, clear of the name label.
+    // vertical dim fader, built as three stacked layers so the peach fill can
+    // reach the track bottom while the knob stays clamped inside the track:
+    //   1. `track`  — constant translucent recess (the light base strip).
+    //   2. `fill`   — peach layer we size by hand, always anchored to the track
+    //                 bottom and growing up to the knob. Because we draw it
+    //                 ourselves it isn't subject to the slider's LV_PART_MAIN
+    //                 padding inset (which used to leave a gap at the bottom).
+    //   3. `sl`     — the slider itself, with a transparent track and indicator
+    //                 so only the white knob shows. Knob-only interaction
+    //                 (ADV_HITTEST); LV_PART_MAIN top/bottom padding == half the
+    //                 knob height clamps the knob travel inside the track, so it
+    //                 never dips into the page-dot / bottom-edge swipe zone.
+    // Layers are created in back-to-front order (track, fill, sl) so the knob
+    // draws over the fill and the fill over the track.
+    lv_obj_t *track = lv_obj_create(tile);
+    lv_obj_remove_flag(track, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(track, 46, 110);
+    lv_obj_align(track, LV_ALIGN_TOP_MID, col_dx[i], 70);
+    lv_obj_set_style_bg_color(track, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(track, LV_OPA_20, 0);  // subtle recess, not a black blob
+    lv_obj_set_style_radius(track, 8, 0);
+    lv_obj_set_style_border_width(track, 0, 0);
+    lv_obj_set_style_pad_all(track, 0, 0);
+
+    lv_obj_t *fill = lv_obj_create(tile);
+    lv_obj_remove_flag(fill, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(fill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(fill, LV_OBJ_FLAG_FLOATING);  // we set its size/pos by hand
+    lv_obj_set_width(fill, 46);
+    lv_obj_set_style_bg_color(fill, lv_color_hex(0xF2C879), 0);
+    lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(fill, 8, 0);
+    lv_obj_set_style_border_width(fill, 0, 0);
+    lv_obj_set_style_pad_all(fill, 0, 0);
+    this->light_fill_[i] = fill;
+
     lv_obj_t *sl = lv_slider_create(tile);
     lv_obj_set_size(sl, 46, 110);
     lv_obj_align(sl, LV_ALIGN_TOP_MID, col_dx[i], 70);
     lv_slider_set_range(sl, 0, 100);
     lv_slider_set_value(sl, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(sl, lv_color_black(), LV_PART_MAIN);  // track = subtle recess
-    lv_obj_set_style_bg_opa(sl, LV_OPA_20, LV_PART_MAIN);           // translucent, not a black blob
-    lv_obj_set_style_radius(sl, 8, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sl, LV_OPA_TRANSP, LV_PART_MAIN);       // track drawn by `track`
     lv_obj_set_style_pad_top(sl, 15, LV_PART_MAIN);     // == knob half-height: clamp travel
     lv_obj_set_style_pad_bottom(sl, 15, LV_PART_MAIN);  // so knob stays inside the track
-    lv_obj_set_style_bg_color(sl, lv_color_hex(0xF2C879), LV_PART_INDICATOR);  // filled
-    lv_obj_set_style_radius(sl, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(sl, LV_OPA_TRANSP, LV_PART_INDICATOR);  // fill drawn by `fill`
     lv_obj_set_style_bg_color(sl, lv_color_white(), LV_PART_KNOB);  // knob
     // Thin wide pill knob: 46 wide x 30 tall (base 46, negative vertical pad).
     lv_obj_set_style_pad_top(sl, -8, LV_PART_KNOB);
@@ -459,12 +490,35 @@ void PatioUI::build_lights_tile_(lv_obj_t *tile) {
     this->light_slider_[i] = sl;
     if (cfg) {
       lv_obj_add_event_cb(sl, ev_light_slider, LV_EVENT_RELEASED, &this->light_ctrl_[i]);
+      lv_obj_add_event_cb(sl, ev_light_dragging, LV_EVENT_VALUE_CHANGED, &this->light_ctrl_[i]);
     } else {
       lv_obj_add_state(sl, LV_STATE_DISABLED);
       lv_obj_set_style_opa(sl, LV_OPA_40, 0);
       lv_obj_set_style_opa(name, LV_OPA_40, 0);
     }
+    this->update_light_fill_(i, 0, false);
   }
+}
+
+// Size/position the peach fill layer: it hugs the track bottom and grows up to
+// the knob centre. Track: TOP_MID at y=70, height 110, 15 px MAIN padding =>
+// knob centre travels y=165 (value 0) .. y=85 (value 100). Hidden when off.
+void PatioUI::update_light_fill_(int i, int value, bool on) {
+  lv_obj_t *fill = this->light_fill_[i];
+  if (fill == nullptr)
+    return;
+  if (!on || value <= 0) {
+    lv_obj_add_flag(fill, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_remove_flag(fill, LV_OBJ_FLAG_HIDDEN);
+  const int col_dx[NUM_LIGHTS] = {-80, 80};
+  const int track_top = 70, track_h = 110, main_pad = 15;
+  const int travel = track_h - 2 * main_pad;                              // 80
+  int knob_cy = (track_top + track_h - main_pad) - (value * travel) / 100;  // 165 .. 85
+  int fill_bottom = track_top + track_h;                                    // 180
+  lv_obj_set_height(fill, fill_bottom - knob_cy);                           // reaches the bottom
+  lv_obj_align(fill, LV_ALIGN_TOP_MID, col_dx[i], knob_cy);
 }
 
 // Reflect the last-known HA on/off + brightness onto the faders (LVGL task).
@@ -479,7 +533,7 @@ void PatioUI::refresh_lights_ui_() {
     // Don't fight the user while they're dragging this fader.
     if (sl != nullptr && !lv_obj_has_state(sl, LV_STATE_PRESSED)) {
       lv_slider_set_value(sl, pct, LV_ANIM_OFF);
-      lv_obj_set_style_bg_opa(sl, on ? LV_OPA_COVER : LV_OPA_60, LV_PART_INDICATOR);
+      this->update_light_fill_(i, pct, on);
     }
     if (name != nullptr)
       lv_obj_set_style_opa(name, on ? LV_OPA_COVER : LV_OPA_50, 0);
