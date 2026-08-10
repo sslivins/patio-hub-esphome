@@ -16,6 +16,7 @@ typedef struct _lv_timer_t lv_timer_t;
 
 #include "esphome/components/api/custom_api_device.h"
 #include "esphome/components/time/real_time_clock.h"
+#include "esphome/core/preferences.h"
 
 namespace esphome {
 namespace patio_ui {
@@ -171,6 +172,11 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // so a mid-run reboot resumes at the true remaining time (HA's `remaining`
   // attribute is frozen while running; only `finishes_at` is accurate).
   std::atomic<long> finishes_at_epoch_{0};
+  // Persisted copy of finishes_at_epoch_ (NVS). Restored in setup() so a warm
+  // reboot shows the countdown immediately from the retained RTC clock, instead
+  // of waiting ~30 s for HA to reconnect and re-push the timer state.
+  ESPPreferenceObject finishes_pref_;
+  void persist_finishes_at_(long epoch);
   std::atomic<bool> active_{false};           // HA timer is running
   std::atomic<int> pending_start_{-1};        // minutes to start, -1 = none
   std::atomic<int> pending_extend_secs_{-1};  // new total secs for timer.start, -1 = none

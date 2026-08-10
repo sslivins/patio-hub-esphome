@@ -26,6 +26,10 @@ namespace patio_ui {
 
 static const char *const TAG = "patio_ui";
 
+// 96px digit+colon font (0-9 and ':') generated with lv_font_conv; compiled as
+// C in patio_font_countdown.c, so it needs C linkage here.
+extern "C" const lv_font_t patio_font_countdown;
+
 // --- palette (matches the native PoC) ---
 #define COL_HEATER lv_color_hex(0x8A4B1E)
 #define COL_LIGHTS lv_color_hex(0x7A6A1E)
@@ -208,9 +212,9 @@ void PatioUI::build_ui_() {
   // it deadlocks lv_snapshot (the /screenshot endpoint), so it's avoided.
   this->heater_value_ = lv_label_create(t_heater);
   lv_obj_set_style_text_color(this->heater_value_, lv_color_white(), 0);
-  lv_obj_set_style_text_font(this->heater_value_, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_font(this->heater_value_, &patio_font_countdown, 0);
   lv_label_set_text(this->heater_value_, "--");
-  lv_obj_align(this->heater_value_, LV_ALIGN_TOP_MID, 0, 78);
+  lv_obj_align(this->heater_value_, LV_ALIGN_TOP_MID, 0, 60);
 
   // Bottom action row: End Now (left, running only) + Start / "+15 min" (right).
   this->heater_btn_left_ = make_btn(t_heater, "End Now", ev_heater_cancel, this);
@@ -323,6 +327,12 @@ void PatioUI::request_extend(int add_min) {
   if (rem < 0)
     rem = 0;
   int total = rem + add_min * 60;
+  // Never let +15 push the timer past the configured maximum.
+  int cap = this->max_minutes_ * 60;
+  if (total > cap)
+    total = cap;
+  if (total <= rem)
+    return;  // already at (or above) the cap — nothing to do
   this->pending_extend_secs_.store(total);
   this->countdown_secs_.store(total);
   this->label_dirty_.store(true);
@@ -685,12 +695,18 @@ void PatioUI::request_cover_action(int action) {
 }
 
 // ---------------- Home Assistant state callbacks (main/API task) ----------------
+void PatioUI::persist_finishes_at_(long epoch) {
+  this->finishes_pref_.save(&epoch);
+  global_preferences->sync();
+}
+
 void PatioUI::on_timer_state_(std::string state) {
   bool active = (state == "active");
   this->active_.store(active);
   if (!active) {
     this->countdown_secs_.store(-1);
     this->finishes_at_epoch_.store(0);
+    this->persist_finishes_at_(0);
   }
   this->label_dirty_.store(true);
   ESP_LOGD(TAG, "timer state: %s", state.c_str());
@@ -713,6 +729,7 @@ void PatioUI::on_timer_finishes_at_(std::string finishes_at) {
   // this in UTC, so parse the wall-clock fields and convert with timegm().
   if (finishes_at.empty() || finishes_at == "None" || finishes_at == "unknown") {
     this->finishes_at_epoch_.store(0);
+    this->persist_finishes_at_(0);
     return;
   }
   int yr = 0, mo = 0, dy = 0, hr = 0, mi = 0, se = 0;
@@ -727,6 +744,7 @@ void PatioUI::on_timer_finishes_at_(std::string finishes_at) {
     long days = static_cast<long>(era) * 146097 + static_cast<long>(doe) - 719468;
     long epoch = days * 86400L + hr * 3600L + mi * 60L + se;
     this->finishes_at_epoch_.store(epoch);
+    this->persist_finishes_at_(epoch);
     this->label_dirty_.store(true);
     ESP_LOGD(TAG, "timer finishes_at: %s (%ld)", finishes_at.c_str(), epoch);
   }
@@ -946,6 +964,30 @@ void PatioUI::setup() {
   bsp_display_lock(0);
   this->build_ui_();
   bsp_display_unlock();
+
+  // Restore the persisted finish time BEFORE subscribing to HA. On a warm reboot
+  // the ESP32 RTC keeps real wall-clock time, so we can show the running
+  // countdown immediately rather than waiting for HA to reconnect (~30 s). HA's
+  // later state push confirms or corrects this (e.g. clears it if cancelled).
+  this->finishes_pref_ = global_preferences->make_preference<long>(fnv1_hash("patio_ui_finishes_at"));
+  long saved_fin = 0;
+  if (this->finishes_pref_.load(&saved_fin) && saved_fin > 0) {
+    bool still_running = true;
+    if (this->time_ != nullptr && this->time_->now().is_valid())
+      still_running = saved_fin > static_cast<long>(this->time_->now().timestamp);
+    if (still_running) {
+      this->finishes_at_epoch_.store(saved_fin);
+      this->active_.store(true);
+      if (this->time_ != nullptr && this->time_->now().is_valid()) {
+        long rem = saved_fin - static_cast<long>(this->time_->now().timestamp);
+        this->countdown_secs_.store(rem > 0 ? static_cast<int>(rem) : 0);
+      }
+      this->label_dirty_.store(true);
+      ESP_LOGI(TAG, "restored persisted timer finish %ld", saved_fin);
+    } else {
+      this->persist_finishes_at_(0);  // expired while powered off
+    }
+  }
 
   // Subscribe to the HA timer (api is a hard dependency, so global_api_server is up).
   this->subscribe_homeassistant_state(&PatioUI::on_timer_state_, this->timer_entity_);
