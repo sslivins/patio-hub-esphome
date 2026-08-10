@@ -998,6 +998,15 @@ void PatioUI::request_media_cmd(int cmd) {
   if (!this->media_configured_)
     return;
   this->pending_media_cmd_.store(cmd);
+  // Optimistically flip the play/pause icon so the button reacts instantly
+  // (called on the LVGL task, so touching the label is safe); HA's later state
+  // push reconciles it if the command was rejected.
+  if (cmd == 1) {
+    int nst = (this->media_state_.load() == 1) ? 2 : 1;  // playing <-> paused
+    this->media_state_.store(nst);
+    if (this->media_playpause_lbl_ != nullptr)
+      lv_label_set_text(this->media_playpause_lbl_, nst == 1 ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+  }
 }
 void PatioUI::request_media_volume(int pct) {
   if (!this->media_configured_)

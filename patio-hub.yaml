@@ -117,4 +117,4 @@ patio_ui:
   # Deck Sonos amp: volume + play/pause/prev/next on the Music tile.
   media:
     entity_id: media_player.sonos_amp
-    label: "Deck"
+    label: "Music"
