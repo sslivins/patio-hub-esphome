@@ -72,8 +72,8 @@ patio_ui:
   run_script: script.patio_heater_run
   stop_script: script.patio_heater_stop
   default_minutes: 30
-  min_minutes: 5
-  max_minutes: 480
+  min_minutes: 15
+  max_minutes: 60
   # Perimeter screen map (as seen standing in front of the Core2):
   #   left / right      -> the single side screens
   #   rear_left/rear_right -> the two side-by-side screens on the wall behind you

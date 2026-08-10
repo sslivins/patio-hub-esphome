@@ -128,6 +128,8 @@ async def to_code(config):
 
     # --- LVGL (v9, pulled in via esp_lvgl_port) ---
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_TILEVIEW", True)
+    esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_ARC", True)
+    esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_ROLLER", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_SNAPSHOT", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_20", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_28", True)

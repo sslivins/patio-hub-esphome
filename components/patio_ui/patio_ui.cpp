@@ -35,21 +35,14 @@ static const char *const TAG = "patio_ui";
 #define COL_SEL lv_color_hex(0xFFD54A)
 
 // event-callback trampolines (run on the LVGL task)
-static void ev_start(lv_event_t *e) {
-  auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
-  self->request_start();
+static void ev_heater_roller(lv_event_t *e) {  // scroll picker -> set minutes
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->on_heater_roller_changed();
 }
-static void ev_stop(lv_event_t *e) {
-  auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
-  self->request_stop();
+static void ev_heater_cancel(lv_event_t *e) {  // Cancel: stop if running, else reset
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->on_heater_cancel();
 }
-static void ev_minus(lv_event_t *e) {
-  auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
-  self->adjust_setpoint(-5);
-}
-static void ev_plus(lv_event_t *e) {
-  auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
-  self->adjust_setpoint(+5);
+static void ev_heater_action(lv_event_t *e) {  // Start (idle) / +15 min (running)
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->on_heater_action();
 }
 static void ev_screen_tap(lv_event_t *e) {
   auto *t = static_cast<PatioUI::ScreenTap *>(lv_event_get_user_data(e));
@@ -80,6 +73,16 @@ static void ev_light_dragging(lv_event_t *e) {  // fader value changing -> resiz
   auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
   int v = lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e)));
   c->self->update_light_fill_(c->idx, v, v > 0);
+}
+
+static lv_obj_t *make_tile_title(lv_obj_t *parent, const char *txt) {
+  lv_obj_t *t = lv_label_create(parent);
+  lv_label_set_text(t, txt);
+  lv_obj_set_style_text_color(t, lv_color_white(), 0);
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_opa(t, LV_OPA_70, 0);  // quiet header, not competing with content
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+  return t;
 }
 
 static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb, void *user) {
@@ -168,32 +171,61 @@ void PatioUI::build_ui_() {
   this->tiles_[1] = t_lights;
   this->tiles_[2] = t_screens;
 
-  // --- heater tile (live, wired to HA) ---
+  // --- heater tile (live, wired to HA): iOS-timer style picker ---
+  //   idle    : scroll the roller to pick 15/30/45/60 min; Start begins the run
+  //   running : big MM:SS countdown; Cancel stops, "+15 min" extends the run
   lv_obj_set_style_bg_color(t_heater, COL_HEATER, 0);
   lv_obj_set_style_bg_opa(t_heater, LV_OPA_COVER, 0);
-  lv_obj_set_flex_flow(t_heater, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(t_heater, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(t_heater, 10, 0);
+  make_tile_title(t_heater, "Heater");
 
-  lv_obj_t *ht = lv_label_create(t_heater);
-  lv_label_set_text(ht, "Heater");
-  lv_obj_set_style_text_color(ht, lv_color_white(), 0);
-  lv_obj_set_style_text_font(ht, &lv_font_montserrat_28, 0);
+  // Vertical scroll picker (idle only). Options map 0..3 -> 15/30/45/60 min.
+  lv_obj_t *roller = lv_roller_create(t_heater);
+  lv_roller_set_options(roller, "15 min\n30 min\n45 min\n60 min", LV_ROLLER_MODE_NORMAL);
+  lv_roller_set_visible_row_count(roller, 3);
+  lv_obj_set_width(roller, 180);
+  lv_obj_align(roller, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_set_style_bg_opa(roller, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(roller, 0, LV_PART_MAIN);
+  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_MAIN);
+  lv_obj_set_style_text_opa(roller, LV_OPA_40, LV_PART_MAIN);      // dim the unselected rows
+  lv_obj_set_style_text_font(roller, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(roller, lv_color_white(), LV_PART_SELECTED);
+  lv_obj_set_style_bg_opa(roller, LV_OPA_10, LV_PART_SELECTED);    // subtle centre band
+  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_SELECTED);
+  lv_obj_set_style_text_opa(roller, LV_OPA_COVER, LV_PART_SELECTED);
+  lv_obj_set_style_text_font(roller, &lv_font_montserrat_28, LV_PART_SELECTED);
+  {
+    int sel = this->setpoint_minutes_.load() / 15 - 1;
+    if (sel < 0) sel = 0;
+    if (sel > 3) sel = 3;
+    lv_roller_set_selected(roller, sel, LV_ANIM_OFF);
+  }
+  lv_obj_add_event_cb(roller, ev_heater_roller, LV_EVENT_VALUE_CHANGED, this);
+  this->heater_roller_ = roller;
 
+  // Big MM:SS countdown (running only). Same slot as the roller. Uses the
+  // largest built-in font (montserrat 48); a transform-based zoom was tried but
+  // it deadlocks lv_snapshot (the /screenshot endpoint), so it's avoided.
   this->heater_value_ = lv_label_create(t_heater);
   lv_obj_set_style_text_color(this->heater_value_, lv_color_white(), 0);
   lv_obj_set_style_text_font(this->heater_value_, &lv_font_montserrat_48, 0);
   lv_label_set_text(this->heater_value_, "--");
+  lv_obj_align(this->heater_value_, LV_ALIGN_TOP_MID, 0, 78);
 
-  lv_obj_t *row = lv_obj_create(t_heater);
-  lv_obj_remove_style_all(row);
-  lv_obj_set_size(row, 308, 52);
-  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  make_btn(row, "-5", ev_minus, this);
-  make_btn(row, "+5", ev_plus, this);
-  make_btn(row, "Start", ev_start, this);
-  make_btn(row, "Stop", ev_stop, this);
+  // Bottom action row: End Now (left, running only) + Start / "+15 min" (right).
+  this->heater_btn_left_ = make_btn(t_heater, "End Now", ev_heater_cancel, this);
+  lv_obj_set_size(this->heater_btn_left_, 132, 48);
+  lv_obj_align(this->heater_btn_left_, LV_ALIGN_BOTTOM_LEFT, 14, -22);
+  lv_obj_set_style_bg_color(this->heater_btn_left_, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(this->heater_btn_left_, LV_OPA_30, 0);
+
+  this->heater_btn_right_ = make_btn(t_heater, "Start", ev_heater_action, this);
+  lv_obj_set_size(this->heater_btn_right_, 132, 48);
+  lv_obj_align(this->heater_btn_right_, LV_ALIGN_BOTTOM_RIGHT, -14, -22);
+  lv_obj_set_style_bg_color(this->heater_btn_right_, lv_color_hex(0xFFB870), 0);
+  lv_obj_set_style_bg_opa(this->heater_btn_right_, LV_OPA_COVER, 0);
+  this->heater_btn_right_lbl_ = lv_obj_get_child(this->heater_btn_right_, 0);
+  lv_obj_set_style_text_color(this->heater_btn_right_lbl_, lv_color_black(), 0);
 
   // --- lights tile (live, wired to HA dimmable lights) ---
   this->build_lights_tile_(t_lights);
@@ -227,7 +259,7 @@ void PatioUI::build_ui_() {
 
   // 1 Hz refresh/countdown driver (LVGL task)
   this->tick_timer_ = lv_timer_create(PatioUI::tick_cb_, 1000, this);
-  this->refresh_heater_label_();
+  this->refresh_heater_ui_();
 }
 
 // Highlights the dot for the currently-active tile (bright), dims the others.
@@ -258,6 +290,43 @@ void PatioUI::adjust_setpoint(int delta) {
   this->setpoint_minutes_.store(m);
   this->label_dirty_.store(true);
 }
+// Scroll picker moved (LVGL task): option idx 0..3 -> 15/30/45/60 min.
+void PatioUI::on_heater_roller_changed() {
+  if (this->heater_roller_ == nullptr)
+    return;
+  int sel = lv_roller_get_selected(this->heater_roller_);
+  this->setpoint_minutes_.store((sel + 1) * 15);
+}
+// Left button (LVGL task): stop a running timer, or reset the picker when idle.
+void PatioUI::on_heater_cancel() {
+  if (this->active_.load()) {
+    this->request_stop();
+  } else if (this->heater_roller_ != nullptr) {
+    this->setpoint_minutes_.store(30);
+    lv_roller_set_selected(this->heater_roller_, 1, LV_ANIM_ON);  // 30 min
+  }
+}
+// Right button (LVGL task): Start when idle, "+15 min" (extend) when running.
+void PatioUI::on_heater_action() {
+  if (this->active_.load())
+    this->request_extend(15);
+  else
+    this->request_start();
+}
+// Extend a running timer by exactly add_min minutes, preserving the current
+// seconds. run_script only accepts whole minutes, so we restart the HA timer
+// itself with a second-precise H:MM:SS duration (the heater switch is already
+// on; the timer's own finish is what turns it back off). Optimistically bump
+// the local countdown so the UI reacts immediately.
+void PatioUI::request_extend(int add_min) {
+  int rem = this->countdown_secs_.load();
+  if (rem < 0)
+    rem = 0;
+  int total = rem + add_min * 60;
+  this->pending_extend_secs_.store(total);
+  this->countdown_secs_.store(total);
+  this->label_dirty_.store(true);
+}
 
 // ---------------- LVGL-task label rendering ----------------
 void PatioUI::tick_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user_data(t))->tick_(); }
@@ -272,28 +341,59 @@ void PatioUI::tick_() {
     this->label_dirty_.store(true);
   }
   if (this->label_dirty_.exchange(false))
-    this->refresh_heater_label_();
+    this->refresh_heater_ui_();
   if (this->light_ui_dirty_.exchange(false))
     this->refresh_lights_ui_();
 }
 
-void PatioUI::refresh_heater_label_() {
+// Redraw the timer tile for the current state (LVGL task).
+//   idle    : show the scroll picker; right button = "Start".
+//   running : show the big MM:SS countdown; left = "Cancel", right = "+15 min".
+void PatioUI::refresh_heater_ui_() {
   if (this->heater_value_ == nullptr)
     return;
-  char buf[16];
-  if (this->active_.load()) {
+  bool active = this->active_.load();
+
+  if (active) {
     int s = this->countdown_secs_.load();
     if (s < 0)
       s = 0;
+    char buf[16];
     int h = s / 3600, m = (s % 3600) / 60, sec = s % 60;
     if (h > 0)
       snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, sec);
     else
       snprintf(buf, sizeof(buf), "%02d:%02d", m, sec);
-  } else {
-    snprintf(buf, sizeof(buf), "%d min", this->setpoint_minutes_.load());
+    lv_label_set_text(this->heater_value_, buf);
   }
-  lv_label_set_text(this->heater_value_, buf);
+
+  // Toggle picker vs countdown.
+  if (this->heater_roller_ != nullptr) {
+    if (active)
+      lv_obj_add_flag(this->heater_roller_, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_remove_flag(this->heater_roller_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (active)
+    lv_obj_remove_flag(this->heater_value_, LV_OBJ_FLAG_HIDDEN);
+  else
+    lv_obj_add_flag(this->heater_value_, LV_OBJ_FLAG_HIDDEN);
+
+  // Right button label: Start / +15 min. Left (End Now) shows only while running.
+  if (this->heater_btn_right_lbl_ != nullptr)
+    lv_label_set_text(this->heater_btn_right_lbl_, active ? "+15 min" : "Start");
+  if (this->heater_btn_left_ != nullptr) {
+    if (active)
+      lv_obj_remove_flag(this->heater_btn_left_, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_add_flag(this->heater_btn_left_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->heater_btn_right_ != nullptr) {
+    if (active)
+      lv_obj_align(this->heater_btn_right_, LV_ALIGN_BOTTOM_RIGHT, -14, -22);
+    else
+      lv_obj_align(this->heater_btn_right_, LV_ALIGN_BOTTOM_MID, 0, -22);  // Start centered
+  }
 }
 
 // ---------------- screens tile (LVGL task) ----------------
@@ -413,6 +513,7 @@ void PatioUI::update_screen_visual_() {
 void PatioUI::build_lights_tile_(lv_obj_t *tile) {
   lv_obj_set_style_bg_color(tile, COL_LIGHTS, 0);
   lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+  make_tile_title(tile, "Lights");
 
   const int col_dx[NUM_LIGHTS] = {-80, 80};  // two columns centred on the tile
   for (int i = 0; i < NUM_LIGHTS; i++) {
@@ -426,7 +527,7 @@ void PatioUI::build_lights_tile_(lv_obj_t *tile) {
     lv_label_set_text(name, cfg ? this->light_label_[i].c_str() : (i == 0 ? "Main" : "BBQ"));
     lv_obj_set_style_text_color(name, lv_color_white(), 0);
     lv_obj_set_style_text_font(name, &lv_font_montserrat_20, 0);
-    lv_obj_align(name, LV_ALIGN_TOP_MID, col_dx[i], 14);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, col_dx[i], 44);
     this->light_name_[i] = name;
     if (cfg) {
       lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
@@ -452,7 +553,7 @@ void PatioUI::build_lights_tile_(lv_obj_t *tile) {
     lv_obj_remove_flag(track, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(track, 46, 110);
-    lv_obj_align(track, LV_ALIGN_TOP_MID, col_dx[i], 70);
+    lv_obj_align(track, LV_ALIGN_TOP_MID, col_dx[i], 82);
     lv_obj_set_style_bg_color(track, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(track, LV_OPA_20, 0);  // subtle recess, not a black blob
     lv_obj_set_style_radius(track, 8, 0);
@@ -473,7 +574,7 @@ void PatioUI::build_lights_tile_(lv_obj_t *tile) {
 
     lv_obj_t *sl = lv_slider_create(tile);
     lv_obj_set_size(sl, 46, 110);
-    lv_obj_align(sl, LV_ALIGN_TOP_MID, col_dx[i], 70);
+    lv_obj_align(sl, LV_ALIGN_TOP_MID, col_dx[i], 82);
     lv_slider_set_range(sl, 0, 100);
     lv_slider_set_value(sl, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_opa(sl, LV_OPA_TRANSP, LV_PART_MAIN);       // track drawn by `track`
@@ -501,8 +602,8 @@ void PatioUI::build_lights_tile_(lv_obj_t *tile) {
 }
 
 // Size/position the peach fill layer: it hugs the track bottom and grows up to
-// the knob centre. Track: TOP_MID at y=70, height 110, 15 px MAIN padding =>
-// knob centre travels y=165 (value 0) .. y=85 (value 100). Hidden when off.
+// the knob centre. Track: TOP_MID at y=82, height 110, 15 px MAIN padding =>
+// knob centre travels y=177 (value 0) .. y=97 (value 100). Hidden when off.
 void PatioUI::update_light_fill_(int i, int value, bool on) {
   lv_obj_t *fill = this->light_fill_[i];
   if (fill == nullptr)
@@ -513,7 +614,7 @@ void PatioUI::update_light_fill_(int i, int value, bool on) {
   }
   lv_obj_remove_flag(fill, LV_OBJ_FLAG_HIDDEN);
   const int col_dx[NUM_LIGHTS] = {-80, 80};
-  const int track_top = 70, track_h = 110, main_pad = 15;
+  const int track_top = 82, track_h = 110, main_pad = 15;
   const int travel = track_h - 2 * main_pad;                              // 80
   int knob_cy = (track_top + track_h - main_pad) - (value * travel) / 100;  // 165 .. 85
   int fill_bottom = track_top + track_h;                                    // 180
@@ -841,6 +942,17 @@ void PatioUI::loop() {
   if (this->pending_stop_.exchange(false)) {
     ESP_LOGI(TAG, "heater stop -> %s", this->stop_script_.c_str());
     this->call_homeassistant_service(this->stop_script_);
+  }
+  // Drain a pending extend: restart the HA timer with a second-precise duration
+  // (heater is already on; only the timer needs lengthening).
+  int ext = this->pending_extend_secs_.exchange(-1);
+  if (ext >= 0) {
+    int h = ext / 3600, m = (ext % 3600) / 60, s = ext % 60;
+    char dur[16];
+    snprintf(dur, sizeof(dur), "%d:%02d:%02d", h, m, s);
+    ESP_LOGI(TAG, "heater extend -> timer.start %s (%s)", this->timer_entity_.c_str(), dur);
+    this->call_homeassistant_service("timer.start",
+                                     {{"entity_id", this->timer_entity_}, {"duration", dur}});
   }
 
   // Drain a pending cover action against the selected screens.

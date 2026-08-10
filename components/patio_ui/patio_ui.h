@@ -50,6 +50,10 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // Button intents (called from the LVGL task; only touch atomics).
   void request_start();
   void request_stop();
+  void request_extend(int add_min);   // +N min: restart run_script with a larger total
+  void on_heater_roller_changed();    // scroll picker moved: store minutes
+  void on_heater_cancel();            // left button: stop if running, else reset picker
+  void on_heater_action();            // right button: Start (idle) / +15 min (running)
   void adjust_setpoint(int delta);
 
   // --- perimeter screen controls ---
@@ -105,7 +109,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- LVGL-task helpers ---
   static void tick_cb_(lv_timer_t *t);
   void tick_();               // 1 Hz, LVGL task
-  void refresh_heater_label_();  // LVGL task only
+  void refresh_heater_ui_();  // LVGL task only — dial value/sub + arc
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
   void update_screen_visual_();              // LVGL task only
   void build_lights_tile_(lv_obj_t *tile);   // LVGL task only
@@ -119,7 +123,11 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   int max_minutes_{480};
 
   // --- LVGL widgets (LVGL task only) ---
-  lv_obj_t *heater_value_{nullptr};
+  lv_obj_t *heater_value_{nullptr};       // big MM:SS countdown (running)
+  lv_obj_t *heater_roller_{nullptr};      // scroll picker (idle)
+  lv_obj_t *heater_btn_left_{nullptr};    // Cancel
+  lv_obj_t *heater_btn_right_{nullptr};   // Start / +15 min
+  lv_obj_t *heater_btn_right_lbl_{nullptr};
   lv_timer_t *tick_timer_{nullptr};
 
   // tileview + bottom page-position dots (LVGL task only)
@@ -156,6 +164,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::atomic<int> countdown_secs_{-1};       // remaining secs when active, else -1
   std::atomic<bool> active_{false};           // HA timer is running
   std::atomic<int> pending_start_{-1};        // minutes to start, -1 = none
+  std::atomic<int> pending_extend_secs_{-1};  // new total secs for timer.start, -1 = none
   std::atomic<bool> pending_stop_{false};
   std::atomic<bool> label_dirty_{true};       // request LVGL-task label refresh
 
