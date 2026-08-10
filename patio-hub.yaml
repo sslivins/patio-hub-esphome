@@ -114,3 +114,7 @@ patio_ui:
     bbq:
       entity_id: light.office_ceiling_over_couch
       label: "BBQ"
+  # Deck Sonos amp: volume + play/pause/prev/next on the Music tile.
+  media:
+    entity_id: media_player.sonos_amp
+    label: "Deck"

@@ -16,6 +16,7 @@ CONF_MAX_MINUTES = "max_minutes"
 
 CONF_SCREENS = "screens"
 CONF_LIGHTS = "lights"
+CONF_MEDIA = "media"
 CONF_ENTITY_ID = "entity_id"
 CONF_LABEL = "label"
 
@@ -68,6 +69,14 @@ LIGHT_SCHEMA = cv.Schema(
     }
 )
 
+# Single deck media_player (Sonos amp): volume + transport control.
+MEDIA_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_ENTITY_ID): cv.string,
+        cv.Optional(CONF_LABEL, default="Music"): cv.string,
+    }
+)
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(PatioUI),
@@ -87,6 +96,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_LIGHTS): cv.Schema(
             {cv.Optional(slot): LIGHT_SCHEMA for slot in LIGHT_SLOTS}
         ),
+        cv.Optional(CONF_MEDIA): MEDIA_SCHEMA,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -120,6 +130,12 @@ async def to_code(config):
             lt = lights[slot]
             label = lt.get(CONF_LABEL, LIGHT_DEFAULT_LABELS[slot])
             cg.add(var.add_light(idx, lt[CONF_ENTITY_ID], label))
+
+    # Deck media player (single Sonos amp: volume + transport).
+    if CONF_MEDIA in config:
+        media = config[CONF_MEDIA]
+        cg.add(var.set_media_entity(media[CONF_ENTITY_ID]))
+        cg.add(var.set_media_label(media[CONF_LABEL]))
 
     # Pull the M5Stack Core2 BSP (esp_lcd + esp_lvgl_port DMA flush + touch).
     esp32.add_idf_component(

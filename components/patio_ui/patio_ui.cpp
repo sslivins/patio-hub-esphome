@@ -36,6 +36,7 @@ extern "C" const lv_font_t patio_font_countdown;
 #define COL_LIGHTS lv_color_hex(0x7A6A1E)
 #define COL_SCREENS lv_color_hex(0x1E5A6E)
 #define COL_TIME lv_color_hex(0x1B2A4A)   // clock/temperature lead tile (deep slate blue)
+#define COL_MEDIA lv_color_hex(0x432A5E)  // deck media tile (deep purple)
 
 // Heater "nearing expiry" fade: the tile background shifts from the normal
 // brown, through amber, to red over the final EXPIRY_FADE_SECS of the run.
@@ -112,6 +113,24 @@ static void ev_light_dragging(lv_event_t *e) {  // fader value changing -> resiz
   auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
   int v = lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e)));
   c->self->update_light_fill_(c->idx, v, v > 0);
+}
+static void ev_media_playpause(lv_event_t *e) {  // deck play/pause toggle
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->request_media_cmd(1);
+}
+static void ev_media_next(lv_event_t *e) {  // deck next track
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->request_media_cmd(2);
+}
+static void ev_media_prev(lv_event_t *e) {  // deck previous track
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->request_media_cmd(3);
+}
+static void ev_media_vol(lv_event_t *e) {  // volume fader released -> push level
+  static_cast<PatioUI *>(lv_event_get_user_data(e))
+      ->request_media_volume(lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e))));
+}
+static void ev_media_vol_live(lv_event_t *e) {  // fader dragging -> update the % label live
+  auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
+  int v = lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e)));
+  self->update_media_vol_label_(v);
 }
 
 static lv_obj_t *make_tile_title(lv_obj_t *parent, const char *txt) {
@@ -207,10 +226,12 @@ void PatioUI::build_ui_() {
   lv_obj_t *t_heater = lv_tileview_add_tile(tv, 1, 0, LV_DIR_HOR);
   lv_obj_t *t_lights = lv_tileview_add_tile(tv, 2, 0, LV_DIR_HOR);
   lv_obj_t *t_screens = lv_tileview_add_tile(tv, 3, 0, LV_DIR_HOR);
+  lv_obj_t *t_media = lv_tileview_add_tile(tv, 4, 0, LV_DIR_HOR);
   this->tiles_[TILE_TIME] = t_time;
   this->tiles_[TILE_HEATER] = t_heater;
   this->tiles_[TILE_LIGHTS] = t_lights;
   this->tiles_[TILE_SCREENS] = t_screens;
+  this->tiles_[TILE_MEDIA] = t_media;
 
   // --- clock + outside-temperature tile (the resting/idle screen) ---
   this->build_time_tile_(t_time);
@@ -276,6 +297,9 @@ void PatioUI::build_ui_() {
 
   // --- screens tile (live perimeter map, wired to HA covers) ---
   this->build_screens_tile_(t_screens);
+
+  // --- deck media tile (live, wired to a HA media_player) ---
+  this->build_media_tile_(t_media);
 
   // Bottom page-position dots (replaces the tileview scroll line). Live on the
   // screen so they float over every tile; updated when the active tile changes.
@@ -534,6 +558,8 @@ void PatioUI::tick_() {
     this->refresh_heater_ui_();
   if (this->light_ui_dirty_.exchange(false))
     this->refresh_lights_ui_();
+  if (this->media_ui_dirty_.exchange(false))
+    this->refresh_media_ui_();
   // Clock tile refresh + idle auto-revert (both LVGL-task safe).
   this->refresh_time_tile_();
   this->maybe_auto_revert_();
@@ -849,6 +875,171 @@ void PatioUI::refresh_lights_ui_() {
     if (name != nullptr)
       lv_obj_set_style_opa(name, on ? LV_OPA_COVER : LV_OPA_50, 0);
   }
+}
+
+// ---------------- deck media tile (LVGL task) ----------------
+// Now-playing text, a horizontal volume fader, and a prev / play-pause / next
+// control bar wired to a single HA media_player (the deck Sonos amp). Both
+// directions are live: HA state changes flow back via refresh_media_ui_().
+void PatioUI::build_media_tile_(lv_obj_t *tile) {
+  lv_obj_set_style_bg_color(tile, COL_MEDIA, 0);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+  make_tile_title(tile, this->media_label_.c_str());
+
+  // Now-playing line: track title if HA gives us one, else the state word.
+  this->media_title_lbl_ = lv_label_create(tile);
+  lv_obj_set_style_text_color(this->media_title_lbl_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->media_title_lbl_, &lv_font_montserrat_20, 0);
+  lv_label_set_long_mode(this->media_title_lbl_, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(this->media_title_lbl_, 280);
+  lv_obj_set_style_text_align(this->media_title_lbl_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(this->media_title_lbl_, "");
+  lv_obj_align(this->media_title_lbl_, LV_ALIGN_TOP_MID, 0, 46);
+
+  // Volume row: speaker icon + horizontal fader + "NN%".
+  lv_obj_t *vicon = lv_label_create(tile);
+  lv_obj_set_style_text_color(vicon, lv_color_white(), 0);
+  lv_obj_set_style_text_font(vicon, &lv_font_montserrat_20, 0);
+  lv_label_set_text(vicon, LV_SYMBOL_VOLUME_MID);
+  lv_obj_align(vicon, LV_ALIGN_TOP_LEFT, 14, 104);
+
+  this->media_vol_slider_ = lv_slider_create(tile);
+  lv_obj_set_size(this->media_vol_slider_, 210, 12);
+  lv_obj_align(this->media_vol_slider_, LV_ALIGN_TOP_MID, 6, 108);
+  lv_slider_set_range(this->media_vol_slider_, 0, 100);
+  lv_slider_set_value(this->media_vol_slider_, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(this->media_vol_slider_, lv_color_hex(0x2A1C3E), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(this->media_vol_slider_, lv_color_hex(0xB98CE6), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(this->media_vol_slider_, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_ext_click_area(this->media_vol_slider_, 12);
+  lv_obj_add_event_cb(this->media_vol_slider_, ev_media_vol, LV_EVENT_RELEASED, this);
+  lv_obj_add_event_cb(this->media_vol_slider_, ev_media_vol_live, LV_EVENT_VALUE_CHANGED, this);
+
+  this->media_vol_pct_ = lv_label_create(tile);
+  lv_obj_set_style_text_color(this->media_vol_pct_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->media_vol_pct_, &lv_font_montserrat_20, 0);
+  lv_label_set_text(this->media_vol_pct_, "--%");
+  lv_obj_align(this->media_vol_pct_, LV_ALIGN_TOP_RIGHT, -14, 104);
+
+  // Transport bar: prev / play-pause / next.
+  lv_obj_t *bar = lv_obj_create(tile);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, 320, 50);
+  lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -22);
+  lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_t *b_prev = make_btn(bar, LV_SYMBOL_PREV, ev_media_prev, this);
+  lv_obj_set_size(b_prev, 98, 44);
+  lv_obj_t *b_pp = make_btn(bar, LV_SYMBOL_PLAY, ev_media_playpause, this);
+  lv_obj_set_size(b_pp, 98, 44);
+  this->media_playpause_lbl_ = lv_obj_get_child(b_pp, 0);  // the symbol label
+  lv_obj_t *b_next = make_btn(bar, LV_SYMBOL_NEXT, ev_media_next, this);
+  lv_obj_set_size(b_next, 98, 44);
+
+  // No entity bound -> show a disabled placeholder rather than dead controls.
+  if (!this->media_configured_) {
+    lv_label_set_text(this->media_title_lbl_, "(no media player)");
+    lv_obj_t *ctrls[3] = {b_prev, b_pp, b_next};
+    for (auto *c : ctrls) {
+      lv_obj_add_state(c, LV_STATE_DISABLED);
+      lv_obj_clear_flag(c, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(c, LV_OPA_40, 0);
+    }
+    lv_obj_add_state(this->media_vol_slider_, LV_STATE_DISABLED);
+    lv_obj_set_style_opa(this->media_vol_slider_, LV_OPA_40, 0);
+  }
+}
+
+// Live "NN%" while the volume fader is being dragged (LVGL task).
+void PatioUI::update_media_vol_label_(int pct) {
+  if (this->media_vol_pct_ == nullptr)
+    return;
+  char b[8];
+  snprintf(b, sizeof(b), "%d%%", pct);
+  lv_label_set_text(this->media_vol_pct_, b);
+}
+
+// Reflect last-known HA state (now-playing, volume, play/pause icon) onto the
+// media tile (LVGL task).
+void PatioUI::refresh_media_ui_() {
+  if (!this->media_configured_)
+    return;
+  int st = this->media_state_.load();
+
+  // Now-playing: prefer the pushed title, fall back to a state word.
+  char title[64];
+  portENTER_CRITICAL(&this->media_title_mux_);
+  strncpy(title, this->media_title_, sizeof(title) - 1);
+  title[sizeof(title) - 1] = '\0';
+  portEXIT_CRITICAL(&this->media_title_mux_);
+  if (this->media_title_lbl_ != nullptr) {
+    if (title[0] != '\0')
+      lv_label_set_text(this->media_title_lbl_, title);
+    else
+      lv_label_set_text(this->media_title_lbl_,
+                        st == 1 ? "Playing" : st == 2 ? "Paused" : "Stopped");
+  }
+
+  // Volume — skip while the user is dragging the fader.
+  int vol = this->media_vol_.load();
+  if (this->media_vol_slider_ != nullptr && vol >= 0 &&
+      !lv_obj_has_state(this->media_vol_slider_, LV_STATE_PRESSED)) {
+    lv_slider_set_value(this->media_vol_slider_, vol, LV_ANIM_OFF);
+    this->update_media_vol_label_(vol);
+  }
+
+  // Play/pause button shows the action it will perform.
+  if (this->media_playpause_lbl_ != nullptr)
+    lv_label_set_text(this->media_playpause_lbl_, st == 1 ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+}
+
+// ---------------- media intents (LVGL task) ----------------
+void PatioUI::request_media_cmd(int cmd) {
+  if (!this->media_configured_)
+    return;
+  this->pending_media_cmd_.store(cmd);
+}
+void PatioUI::request_media_volume(int pct) {
+  if (!this->media_configured_)
+    return;
+  if (pct < 0)
+    pct = 0;
+  if (pct > 100)
+    pct = 100;
+  this->pending_media_vol_.store(pct);
+}
+
+// ---------------- media HA -> UI callbacks (main/API task) ----------------
+void PatioUI::on_media_state_(std::string state) {
+  int st = (state == "playing") ? 1 : (state == "paused") ? 2 : 0;
+  this->media_state_.store(st);
+  this->media_ui_dirty_.store(true);
+  ESP_LOGD(TAG, "media state -> %s (%d)", state.c_str(), st);
+}
+void PatioUI::on_media_volume_(std::string volume) {
+  // HA 'volume_level' is a 0.0..1.0 float -> 0..100 %.
+  char *end = nullptr;
+  float v = strtof(volume.c_str(), &end);
+  if (end != volume.c_str()) {
+    int pct = static_cast<int>(v * 100.0f + 0.5f);
+    if (pct < 0)
+      pct = 0;
+    if (pct > 100)
+      pct = 100;
+    this->media_vol_.store(pct);
+    this->media_ui_dirty_.store(true);
+    ESP_LOGD(TAG, "media volume -> %s (%d%%)", volume.c_str(), pct);
+  }
+}
+void PatioUI::on_media_title_(std::string title) {
+  if (title == "unknown" || title == "unavailable" || title == "None")
+    title.clear();
+  portENTER_CRITICAL(&this->media_title_mux_);
+  strncpy(this->media_title_, title.c_str(), sizeof(this->media_title_) - 1);
+  this->media_title_[sizeof(this->media_title_) - 1] = '\0';
+  portEXIT_CRITICAL(&this->media_title_mux_);
+  this->media_ui_dirty_.store(true);
+  ESP_LOGD(TAG, "media title -> %s", title.c_str());
 }
 
 // ---------------- screen intents (LVGL task) ----------------
@@ -1265,6 +1456,17 @@ void PatioUI::setup() {
   }
   this->light_ui_dirty_.store(true);
 
+  // Deck media player: subscribe to state + volume + now-playing title so the
+  // media tile reflects external Sonos changes; init the pending intents.
+  this->pending_media_vol_.store(-1);
+  this->pending_media_cmd_.store(0);
+  if (this->media_configured_) {
+    this->subscribe_homeassistant_state(&PatioUI::on_media_state_, this->media_entity_);
+    this->subscribe_homeassistant_state(&PatioUI::on_media_volume_, this->media_entity_, "volume_level");
+    this->subscribe_homeassistant_state(&PatioUI::on_media_title_, this->media_entity_, "media_title");
+  }
+  this->media_ui_dirty_.store(true);
+
   ESP_LOGI(TAG, "UI up; heater tile bound to %s", this->timer_entity_.c_str());
 
   // Live screen capture endpoint (uncompressed PNG on :8080/screenshot).
@@ -1333,6 +1535,26 @@ void PatioUI::loop() {
       this->call_homeassistant_service(svc2, {{"entity_id", this->light_entity_[i]}, {"transition", "0"}});
     }
   }
+
+  // Drain pending deck-media intents against the Sonos amp.
+  if (this->media_configured_) {
+    int mv = this->pending_media_vol_.exchange(-1);
+    if (mv >= 0) {
+      char lvl[8];
+      snprintf(lvl, sizeof(lvl), "%.2f", mv / 100.0f);
+      ESP_LOGI(TAG, "media volume %d%% -> %s", mv, this->media_entity_.c_str());
+      this->call_homeassistant_service("media_player.volume_set",
+                                       {{"entity_id", this->media_entity_}, {"volume_level", lvl}});
+    }
+    int mc = this->pending_media_cmd_.exchange(0);
+    if (mc != 0) {
+      const char *svc3 = (mc == 1) ? "media_player.media_play_pause"
+                         : (mc == 2) ? "media_player.media_next_track"
+                                     : "media_player.media_previous_track";
+      ESP_LOGI(TAG, "media cmd %d -> %s (%s)", mc, svc3, this->media_entity_.c_str());
+      this->call_homeassistant_service(svc3, {{"entity_id", this->media_entity_}});
+    }
+  }
 }
 
 void PatioUI::dump_config() {
@@ -1351,6 +1573,8 @@ void PatioUI::dump_config() {
       ESP_LOGCONFIG(TAG, "  light[%d]  %-9s -> %s", i, this->light_label_[i].c_str(),
                     this->light_entity_[i].c_str());
   }
+  if (this->media_configured_)
+    ESP_LOGCONFIG(TAG, "  media     %-9s -> %s", this->media_label_.c_str(), this->media_entity_.c_str());
 }
 
 }  // namespace patio_ui

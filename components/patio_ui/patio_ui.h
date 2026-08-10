@@ -7,6 +7,9 @@
 #include <atomic>
 #include <string>
 
+#include "freertos/FreeRTOS.h"  // portMUX_TYPE for the cross-task now-playing title
+#include "freertos/task.h"
+
 // LVGL (v9, pulled in as an IDF component via esp_lvgl_port). Forward-declare the
 // handle type so the header stays light; the .cpp pulls in the full LVGL headers.
 struct _lv_obj_t;
@@ -46,7 +49,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   static constexpr int TILE_HEATER = 1;
   static constexpr int TILE_LIGHTS = 2;
   static constexpr int TILE_SCREENS = 3;
-  static constexpr int NUM_TILES = 4;
+  static constexpr int TILE_MEDIA = 4;
+  static constexpr int NUM_TILES = 5;
   // Revert to the clock tile (or the heater tile if a timer is running) after
   // this much untouched time.
   static constexpr uint32_t IDLE_REVERT_MS = 60000;
@@ -108,6 +112,19 @@ class PatioUI : public Component, public api::CustomAPIDevice {
     int idx{0};
   };
 
+  // --- deck media player (single Sonos amp) ---
+  // YAML codegen: bind the media tile to a media_player entity + display label.
+  void set_media_entity(const std::string &s) {
+    this->media_entity_ = s;
+    this->media_configured_ = true;
+  }
+  void set_media_label(const std::string &s) { this->media_label_ = s; }
+
+  // Media intents (called from the LVGL task; only touch atomics).
+  void request_media_cmd(int cmd);        // 1=play/pause, 2=next, 3=prev
+  void request_media_volume(int pct);     // 0..100
+  void update_media_vol_label_(int pct);  // LVGL task — live "NN%" while dragging
+
  protected:
   // --- display / UI bring-up ---
   void build_ui_();
@@ -124,6 +141,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void on_light_bright_(std::string entity_id, std::string brightness);  // 0..255
   void on_outside_temp_(std::string state);                              // clock-tile temperature
   void on_temp_unit_(std::string unit);                                  // temp sensor's unit (°C/°F)
+  void on_media_state_(std::string state);                               // playing/paused/idle
+  void on_media_volume_(std::string volume);                             // 0.0..1.0
+  void on_media_title_(std::string title);                               // now-playing text
   int light_index_for_entity_(const std::string &entity_id) const;
 
   // --- LVGL-task helpers ---
@@ -139,6 +159,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void update_screen_visual_();              // LVGL task only
   void build_lights_tile_(lv_obj_t *tile);   // LVGL task only
   void refresh_lights_ui_();                 // LVGL task only
+  void build_media_tile_(lv_obj_t *tile);    // LVGL task only
+  void refresh_media_ui_();                  // LVGL task only
 
   // --- config ---
   std::string run_script_{"script.patio_heater_run"};
@@ -182,6 +204,12 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   lv_obj_t *light_name_[NUM_LIGHTS]{};
   lv_obj_t *light_fill_[NUM_LIGHTS]{};   // manual peach fill layer (reaches track bottom)
 
+  // media tile widgets (LVGL task only)
+  lv_obj_t *media_title_lbl_{nullptr};   // now-playing / state text
+  lv_obj_t *media_vol_slider_{nullptr};  // horizontal volume fader
+  lv_obj_t *media_vol_pct_{nullptr};     // "NN%"
+  lv_obj_t *media_playpause_lbl_{nullptr};  // symbol on the play/pause button
+
   // --- screen config / selection ---
   std::string screen_entity_[NUM_SCREENS];
   std::string screen_label_[NUM_SCREENS];
@@ -194,6 +222,11 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::string light_label_[NUM_LIGHTS];
   bool light_configured_[NUM_LIGHTS]{};
   LightCtrl light_ctrl_[NUM_LIGHTS];
+
+  // --- media config ---
+  std::string media_entity_;
+  std::string media_label_{"Music"};
+  bool media_configured_{false};
 
   // --- cross-task state (atomics) ---
   std::atomic<int> setpoint_minutes_{30};     // desired run length
@@ -233,6 +266,17 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::atomic<bool> temp_is_f_{false};    // native unit is °F -> convert to °C for display
   std::atomic<bool> temp_valid_{false};   // false until a numeric value arrives
   std::atomic<bool> temp_dirty_{true};    // HA changed -> refresh the label
+
+  // media tile: Sonos amp state (HA -> UI) + pending intents (UI -> HA).
+  std::atomic<int> media_state_{0};       // 0 idle/stopped, 1 playing, 2 paused
+  std::atomic<int> media_vol_{-1};        // 0..100 from HA, -1 unknown
+  std::atomic<bool> media_ui_dirty_{true};// HA changed -> refresh the tile
+  std::atomic<int> pending_media_vol_{-1};// 0..100 to send, -1 none
+  std::atomic<int> pending_media_cmd_{0}; // 0 none, 1 play/pause, 2 next, 3 prev
+  // Now-playing title (API task writes, LVGL task reads) guarded by a spinlock,
+  // since std::string isn't safe to share across tasks lock-free.
+  portMUX_TYPE media_title_mux_ = portMUX_INITIALIZER_UNLOCKED;
+  char media_title_[64]{};
 };
 
 }  // namespace patio_ui
