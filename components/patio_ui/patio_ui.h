@@ -54,7 +54,6 @@ class PatioUI : public Component, public api::CustomAPIDevice {
 
   // --- perimeter screen controls ---
   static constexpr int NUM_SCREENS = 4;   // left, right, rear_left, rear_right
-
   // YAML codegen: bind a screen slot to a cover entity + display label.
   void add_screen(int slot, const std::string &entity, const std::string &label);
 
@@ -71,6 +70,22 @@ class PatioUI : public Component, public api::CustomAPIDevice {
     int idx{0};
   };
 
+  // --- patio light controls ---
+  static constexpr int NUM_LIGHTS = 2;   // main, bbq
+
+  // YAML codegen: bind a light slot to a light entity + display label.
+  void add_light(int slot, const std::string &entity, const std::string &label);
+
+  // Light intents (called from the LVGL task; only touch atomics).
+  void request_light_brightness(int idx, int pct);  // 0..100 (0 => off)
+  void request_light_toggle(int idx);
+
+  // Binds a light index to its LVGL slider / name-tap callbacks.
+  struct LightCtrl {
+    PatioUI *self{nullptr};
+    int idx{0};
+  };
+
  protected:
   // --- display / UI bring-up ---
   void build_ui_();
@@ -82,6 +97,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- Home Assistant state subscriptions (run on main/API task) ---
   void on_timer_state_(std::string state);
   void on_timer_remaining_(std::string remaining);
+  void on_light_state_(std::string entity_id, std::string state);       // "on"/"off"
+  void on_light_bright_(std::string entity_id, std::string brightness);  // 0..255
+  int light_index_for_entity_(const std::string &entity_id) const;
 
   // --- LVGL-task helpers ---
   static void tick_cb_(lv_timer_t *t);
@@ -89,6 +107,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void refresh_heater_label_();  // LVGL task only
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
   void update_screen_visual_();              // LVGL task only
+  void build_lights_tile_(lv_obj_t *tile);   // LVGL task only
+  void refresh_lights_ui_();                 // LVGL task only
 
   // --- config ---
   std::string run_script_{"script.patio_heater_run"};
@@ -112,12 +132,22 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   lv_obj_t *ctrl_stop_{nullptr};
   lv_obj_t *ctrl_down_{nullptr};
 
+  // light tile widgets (LVGL task only)
+  lv_obj_t *light_slider_[NUM_LIGHTS]{};
+  lv_obj_t *light_name_[NUM_LIGHTS]{};
+
   // --- screen config / selection ---
   std::string screen_entity_[NUM_SCREENS];
   std::string screen_label_[NUM_SCREENS];
   bool screen_configured_[NUM_SCREENS]{};
   ScreenTap screen_tap_[NUM_SCREENS];
   bool screen_sel_[NUM_SCREENS]{};  // LVGL task only
+
+  // --- light config ---
+  std::string light_entity_[NUM_LIGHTS];
+  std::string light_label_[NUM_LIGHTS];
+  bool light_configured_[NUM_LIGHTS]{};
+  LightCtrl light_ctrl_[NUM_LIGHTS];
 
   // --- cross-task state (atomics) ---
   std::atomic<int> setpoint_minutes_{30};     // desired run length
@@ -130,6 +160,15 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // screens: UI -> HA pending cover action (Somfy RTS = command-only, no state)
   std::atomic<int> pending_cover_action_{0};     // 0 none,1 open/up,2 close/down,3 stop
   std::atomic<unsigned> pending_cover_mask_{0};  // bitmask of selected screens
+
+  // lights: bidirectional (lights report state, unlike Somfy).
+  //   HA -> UI: last known on/off + brightness, refreshed on the LVGL task.
+  //   UI -> HA: a pending brightness set and/or a pending on/off toggle.
+  std::atomic<int> light_bright_[NUM_LIGHTS];          // 0..100 last brightness from HA
+  std::atomic<bool> light_on_[NUM_LIGHTS];             // on/off from HA
+  std::atomic<bool> light_ui_dirty_{false};            // HA changed -> refresh sliders
+  std::atomic<int> pending_light_bright_[NUM_LIGHTS];  // -1 none, else 0..100 to send
+  std::atomic<bool> pending_light_toggle_[NUM_LIGHTS]; // request on/off toggle
 };
 
 }  // namespace patio_ui

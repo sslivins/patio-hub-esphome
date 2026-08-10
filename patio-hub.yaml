@@ -92,3 +92,13 @@ patio_ui:
     rear_right:
       entity_id: cover.office_door_shade
       label: "Rear Right"
+  # Patio light groups shown as two vertical dim faders (Main | BBQ).
+  # Stand-in office lights on the Mercer Island HA until the real Sun Peaks
+  # patio light groups exist; just swap the entity_id later.
+  lights:
+    main:
+      entity_id: light.office_ceiling_over_desk
+      label: "Main"
+    bbq:
+      entity_id: light.office_ceiling_over_couch
+      label: "BBQ"

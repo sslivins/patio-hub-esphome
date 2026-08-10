@@ -14,6 +14,7 @@ CONF_MIN_MINUTES = "min_minutes"
 CONF_MAX_MINUTES = "max_minutes"
 
 CONF_SCREENS = "screens"
+CONF_LIGHTS = "lights"
 CONF_ENTITY_ID = "entity_id"
 CONF_LABEL = "label"
 
@@ -27,6 +28,14 @@ SCREEN_DEFAULT_LABELS = {
     "right": "Right",
     "rear_left": "Rear Left",
     "rear_right": "Rear Right",
+}
+
+# Two dimmable light groups on the patio, shown as side-by-side vertical faders.
+# Order here is the slot index passed to the C++ component.
+LIGHT_SLOTS = ["main", "bbq"]
+LIGHT_DEFAULT_LABELS = {
+    "main": "Main",
+    "bbq": "BBQ",
 }
 
 # Pinned to our esp-bsp fork branch (PR espressif/esp-bsp#813). This BSP:
@@ -51,6 +60,13 @@ SCREEN_SCHEMA = cv.Schema(
     }
 )
 
+LIGHT_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_ENTITY_ID): cv.string,
+        cv.Optional(CONF_LABEL): cv.string,
+    }
+)
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(PatioUI),
@@ -62,6 +78,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_MAX_MINUTES, default=480): cv.int_range(min=1, max=1440),
         cv.Optional(CONF_SCREENS): cv.Schema(
             {cv.Optional(slot): SCREEN_SCHEMA for slot in SCREEN_SLOTS}
+        ),
+        cv.Optional(CONF_LIGHTS): cv.Schema(
+            {cv.Optional(slot): LIGHT_SCHEMA for slot in LIGHT_SLOTS}
         ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
@@ -85,6 +104,14 @@ async def to_code(config):
             sc = screens[slot]
             label = sc.get(CONF_LABEL, SCREEN_DEFAULT_LABELS[slot])
             cg.add(var.add_screen(idx, sc[CONF_ENTITY_ID], label))
+
+    # Dimmable light groups (each slot -> a vertical fader).
+    lights = config.get(CONF_LIGHTS, {})
+    for idx, slot in enumerate(LIGHT_SLOTS):
+        if slot in lights:
+            lt = lights[slot]
+            label = lt.get(CONF_LABEL, LIGHT_DEFAULT_LABELS[slot])
+            cg.add(var.add_light(idx, lt[CONF_ENTITY_ID], label))
 
     # Pull the M5Stack Core2 BSP (esp_lcd + esp_lvgl_port DMA flush + touch).
     esp32.add_idf_component(

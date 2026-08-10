@@ -18,6 +18,7 @@
 #include "esphome/core/application.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace esphome {
@@ -65,6 +66,15 @@ static void ev_cover_stop(lv_event_t *e) {
 }
 static void ev_tile_scroll(lv_event_t *e) {  // active tile changed -> update dots
   static_cast<PatioUI *>(lv_event_get_user_data(e))->update_page_dots_();
+}
+static void ev_light_slider(lv_event_t *e) {  // dim fader released -> push brightness
+  auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
+  int v = lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e)));
+  c->self->request_light_brightness(c->idx, v);
+}
+static void ev_light_toggle(lv_event_t *e) {  // tap group name -> toggle on/off
+  auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
+  c->self->request_light_toggle(c->idx);
 }
 
 static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb, void *user) {
@@ -137,36 +147,6 @@ static lv_obj_t *make_screen_button(lv_obj_t *parent, void *user, ScreenOrient o
   return btn;
 }
 
-// A simple static tile: colored bg, title, big value, up to 3 (dummy) buttons.
-static void build_static_tile(lv_obj_t *tile, lv_color_t bg, const char *title, const char *big, const char *b1,
-                              const char *b2, const char *b3) {
-  lv_obj_set_style_bg_color(tile, bg, 0);
-  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
-  lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(tile, 10, 0);
-
-  lv_obj_t *t = lv_label_create(tile);
-  lv_label_set_text(t, title);
-  lv_obj_set_style_text_color(t, lv_color_white(), 0);
-  lv_obj_set_style_text_font(t, &lv_font_montserrat_28, 0);
-
-  lv_obj_t *v = lv_label_create(tile);
-  lv_label_set_text(v, big);
-  lv_obj_set_style_text_color(v, lv_color_white(), 0);
-  lv_obj_set_style_text_font(v, &lv_font_montserrat_48, 0);
-
-  lv_obj_t *row = lv_obj_create(tile);
-  lv_obj_remove_style_all(row);
-  lv_obj_set_size(row, 300, 52);
-  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  make_btn(row, b1, nullptr, nullptr);
-  make_btn(row, b2, nullptr, nullptr);
-  if (b3 != nullptr)
-    make_btn(row, b3, nullptr, nullptr);
-}
-
 void PatioUI::build_ui_() {
   lv_obj_t *scr = lv_screen_active();
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -210,8 +190,8 @@ void PatioUI::build_ui_() {
   make_btn(row, "Start", ev_start, this);
   make_btn(row, "Stop", ev_stop, this);
 
-  // --- lights tile (static placeholder for now) ---
-  build_static_tile(t_lights, COL_LIGHTS, "Lights", "75%", "Off", "Dim", "On");
+  // --- lights tile (live, wired to HA dimmable lights) ---
+  this->build_lights_tile_(t_lights);
 
   // --- screens tile (live perimeter map, wired to HA covers) ---
   this->build_screens_tile_(t_screens);
@@ -288,6 +268,8 @@ void PatioUI::tick_() {
   }
   if (this->label_dirty_.exchange(false))
     this->refresh_heater_label_();
+  if (this->light_ui_dirty_.exchange(false))
+    this->refresh_lights_ui_();
 }
 
 void PatioUI::refresh_heater_label_() {
@@ -419,6 +401,91 @@ void PatioUI::update_screen_visual_() {
   }
 }
 
+// ---------------- lights tile (LVGL task) ----------------
+// Two vertical dim faders (Main | BBQ). Tapping a group name toggles it on/off;
+// dragging its fader sets brightness (0 => off). Both directions are live: HA
+// state changes are reflected back onto the faders via refresh_lights_ui_().
+void PatioUI::build_lights_tile_(lv_obj_t *tile) {
+  lv_obj_set_style_bg_color(tile, COL_LIGHTS, 0);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+
+  const int col_dx[NUM_LIGHTS] = {-80, 80};  // two columns centred on the tile
+  for (int i = 0; i < NUM_LIGHTS; i++) {
+    this->light_ctrl_[i] = LightCtrl{this, i};
+    bool cfg = this->light_configured_[i];
+
+    // group name — tap target that toggles the light on/off. Kept at the very
+    // top so the fully-raised (on) knob never reaches up into it: that lets us
+    // give the knob a large grab area without stealing taps meant for the label.
+    lv_obj_t *name = lv_label_create(tile);
+    lv_label_set_text(name, cfg ? this->light_label_[i].c_str() : (i == 0 ? "Main" : "BBQ"));
+    lv_obj_set_style_text_color(name, lv_color_white(), 0);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_20, 0);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, col_dx[i], 14);
+    this->light_name_[i] = name;
+    if (cfg) {
+      lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_ext_click_area(name, 16);  // enlarge the touch target
+      lv_obj_add_event_cb(name, ev_light_toggle, LV_EVENT_CLICKED, &this->light_ctrl_[i]);
+    }
+
+    // vertical dim fader. Knob-only interaction (ADV_HITTEST): you grab the
+    // white knob and drag it; pressing the bare track does nothing. The knob is
+    // a thin, wide pill. LV_PART_MAIN top/bottom padding (== half the knob
+    // height) insets the indicator travel so the knob is CLAMPED inside the
+    // track rectangle at both extremes: at value 0 its bottom sits exactly on
+    // the track bottom, never dipping into the page-dot strip / bottom-edge
+    // swipe zone (which was stealing the grab). At value 100 its top sits on
+    // the track top, clear of the name label.
+    lv_obj_t *sl = lv_slider_create(tile);
+    lv_obj_set_size(sl, 46, 110);
+    lv_obj_align(sl, LV_ALIGN_TOP_MID, col_dx[i], 70);
+    lv_slider_set_range(sl, 0, 100);
+    lv_slider_set_value(sl, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(sl, lv_color_black(), LV_PART_MAIN);  // track = subtle recess
+    lv_obj_set_style_bg_opa(sl, LV_OPA_20, LV_PART_MAIN);           // translucent, not a black blob
+    lv_obj_set_style_radius(sl, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(sl, 15, LV_PART_MAIN);     // == knob half-height: clamp travel
+    lv_obj_set_style_pad_bottom(sl, 15, LV_PART_MAIN);  // so knob stays inside the track
+    lv_obj_set_style_bg_color(sl, lv_color_hex(0xF2C879), LV_PART_INDICATOR);  // filled
+    lv_obj_set_style_radius(sl, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sl, lv_color_white(), LV_PART_KNOB);  // knob
+    // Thin wide pill knob: 46 wide x 30 tall (base 46, negative vertical pad).
+    lv_obj_set_style_pad_top(sl, -8, LV_PART_KNOB);
+    lv_obj_set_style_pad_bottom(sl, -8, LV_PART_KNOB);
+    lv_obj_set_style_radius(sl, 10, LV_PART_KNOB);
+    lv_obj_add_flag(sl, LV_OBJ_FLAG_ADV_HITTEST);
+    lv_obj_set_ext_click_area(sl, 10);  // small forgiveness halo around the knob
+    this->light_slider_[i] = sl;
+    if (cfg) {
+      lv_obj_add_event_cb(sl, ev_light_slider, LV_EVENT_RELEASED, &this->light_ctrl_[i]);
+    } else {
+      lv_obj_add_state(sl, LV_STATE_DISABLED);
+      lv_obj_set_style_opa(sl, LV_OPA_40, 0);
+      lv_obj_set_style_opa(name, LV_OPA_40, 0);
+    }
+  }
+}
+
+// Reflect the last-known HA on/off + brightness onto the faders (LVGL task).
+void PatioUI::refresh_lights_ui_() {
+  for (int i = 0; i < NUM_LIGHTS; i++) {
+    if (!this->light_configured_[i])
+      continue;
+    lv_obj_t *sl = this->light_slider_[i];
+    lv_obj_t *name = this->light_name_[i];
+    bool on = this->light_on_[i].load();
+    int pct = on ? this->light_bright_[i].load() : 0;
+    // Don't fight the user while they're dragging this fader.
+    if (sl != nullptr && !lv_obj_has_state(sl, LV_STATE_PRESSED)) {
+      lv_slider_set_value(sl, pct, LV_ANIM_OFF);
+      lv_obj_set_style_bg_opa(sl, on ? LV_OPA_COVER : LV_OPA_60, LV_PART_INDICATOR);
+    }
+    if (name != nullptr)
+      lv_obj_set_style_opa(name, on ? LV_OPA_COVER : LV_OPA_50, 0);
+  }
+}
+
 // ---------------- screen intents (LVGL task) ----------------
 void PatioUI::add_screen(int slot, const std::string &entity, const std::string &label) {
   if (slot < 0 || slot >= NUM_SCREENS)
@@ -465,6 +532,61 @@ void PatioUI::on_timer_remaining_(std::string remaining) {
     this->label_dirty_.store(true);
     ESP_LOGD(TAG, "timer remaining: %s (%d s)", remaining.c_str(), h * 3600 + m * 60 + s);
   }
+}
+
+// ---------------- lights (bidirectional: HA <-> panel) ----------------
+void PatioUI::add_light(int slot, const std::string &entity, const std::string &label) {
+  if (slot < 0 || slot >= NUM_LIGHTS)
+    return;
+  this->light_entity_[slot] = entity;
+  this->light_label_[slot] = label;
+  this->light_configured_[slot] = true;
+}
+
+int PatioUI::light_index_for_entity_(const std::string &entity_id) const {
+  for (int i = 0; i < NUM_LIGHTS; i++) {
+    if (this->light_configured_[i] && this->light_entity_[i] == entity_id)
+      return i;
+  }
+  return -1;
+}
+
+// UI -> HA intents (called from the LVGL task; only touch atomics).
+void PatioUI::request_light_brightness(int idx, int pct) {
+  if (idx < 0 || idx >= NUM_LIGHTS || !this->light_configured_[idx])
+    return;
+  if (pct < 0)
+    pct = 0;
+  if (pct > 100)
+    pct = 100;
+  this->pending_light_bright_[idx].store(pct);
+}
+void PatioUI::request_light_toggle(int idx) {
+  if (idx < 0 || idx >= NUM_LIGHTS || !this->light_configured_[idx])
+    return;
+  this->pending_light_toggle_[idx].store(true);
+}
+
+// HA -> UI state callbacks (run on the main/API task; only touch atomics).
+void PatioUI::on_light_state_(std::string entity_id, std::string state) {
+  int idx = this->light_index_for_entity_(entity_id);
+  if (idx < 0)
+    return;
+  this->light_on_[idx].store(state == "on");
+  this->light_ui_dirty_.store(true);
+  ESP_LOGD(TAG, "light[%d] %s -> %s", idx, entity_id.c_str(), state.c_str());
+}
+void PatioUI::on_light_bright_(std::string entity_id, std::string brightness) {
+  int idx = this->light_index_for_entity_(entity_id);
+  if (idx < 0)
+    return;
+  // HA 'brightness' attribute is 0..255 (empty/"None" when off) -> 0..100 %.
+  int b255 = atoi(brightness.c_str());
+  int pct = (b255 <= 0) ? 0 : (b255 * 100 + 127) / 255;
+  if (pct > 0)  // keep last non-zero level so an off->on toggle can restore it
+    this->light_bright_[idx].store(pct);
+  this->light_ui_dirty_.store(true);
+  ESP_LOGD(TAG, "light[%d] brightness %d/255 (%d%%)", idx, b255, pct);
 }
 
 // ---------------- ESPHome Component ----------------
@@ -635,6 +757,20 @@ void PatioUI::setup() {
   // don't subscribe to their state — the tiles are selectors + momentary
   // up/stop/down commands.
 
+  // Lights are bidirectional: init per-light atomics, then subscribe to HA so
+  // the faders reflect external changes (and toggles can restore last level).
+  for (int i = 0; i < NUM_LIGHTS; i++) {
+    this->pending_light_bright_[i].store(-1);
+    this->pending_light_toggle_[i].store(false);
+    this->light_bright_[i].store(0);
+    this->light_on_[i].store(false);
+    if (this->light_configured_[i]) {
+      this->subscribe_homeassistant_state(&PatioUI::on_light_state_, this->light_entity_[i]);
+      this->subscribe_homeassistant_state(&PatioUI::on_light_bright_, this->light_entity_[i], "brightness");
+    }
+  }
+  this->light_ui_dirty_.store(true);
+
   ESP_LOGI(TAG, "UI up; heater tile bound to %s", this->timer_entity_.c_str());
 
   // Live screen capture endpoint (uncompressed PNG on :8080/screenshot).
@@ -665,6 +801,33 @@ void PatioUI::loop() {
       }
     }
   }
+
+  // Drain pending light intents against each configured light.
+  for (int i = 0; i < NUM_LIGHTS; i++) {
+    if (!this->light_configured_[i])
+      continue;
+    int pct = this->pending_light_bright_[i].exchange(-1);
+    if (pct >= 0) {
+      if (pct == 0) {
+        ESP_LOGI(TAG, "light[%d] off -> %s", i, this->light_entity_[i].c_str());
+        this->call_homeassistant_service("light.turn_off",
+                                         {{"entity_id", this->light_entity_[i]}, {"transition", "0"}});
+      } else {
+        ESP_LOGI(TAG, "light[%d] dim %d%% -> %s", i, pct, this->light_entity_[i].c_str());
+        this->call_homeassistant_service(
+            "light.turn_on",
+            {{"entity_id", this->light_entity_[i]}, {"brightness_pct", std::to_string(pct)}, {"transition", "0"}});
+      }
+    }
+    if (this->pending_light_toggle_[i].exchange(false)) {
+      bool on = this->light_on_[i].load();
+      const char *svc2 = on ? "light.turn_off" : "light.turn_on";
+      ESP_LOGI(TAG, "light[%d] toggle (%s) -> %s", i, on ? "off" : "on", this->light_entity_[i].c_str());
+      // transition:0 so turn-off snaps instead of using the bulb's default
+      // fade-out (which makes off feel much slower than on).
+      this->call_homeassistant_service(svc2, {{"entity_id", this->light_entity_[i]}, {"transition", "0"}});
+    }
+  }
 }
 
 void PatioUI::dump_config() {
@@ -677,6 +840,11 @@ void PatioUI::dump_config() {
     if (this->screen_configured_[i])
       ESP_LOGCONFIG(TAG, "  screen[%d] %-9s -> %s", i, this->screen_label_[i].c_str(),
                     this->screen_entity_[i].c_str());
+  }
+  for (int i = 0; i < NUM_LIGHTS; i++) {
+    if (this->light_configured_[i])
+      ESP_LOGCONFIG(TAG, "  light[%d]  %-9s -> %s", i, this->light_label_[i].c_str(),
+                    this->light_entity_[i].c_str());
   }
 }
 
