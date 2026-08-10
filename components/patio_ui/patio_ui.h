@@ -46,7 +46,10 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void set_stop_script(const std::string &s) { this->stop_script_ = s; }
   void set_timer_entity(const std::string &s) { this->timer_entity_ = s; }
   void set_time(time::RealTimeClock *t) { this->time_ = t; }
-  void set_default_minutes(int m) { this->setpoint_minutes_ = m; }
+  void set_default_minutes(int m) {
+    this->default_minutes_ = m;
+    this->setpoint_minutes_ = m;
+  }
   void set_min_minutes(int m) { this->min_minutes_ = m; }
   void set_max_minutes(int m) { this->max_minutes_ = m; }
 
@@ -119,6 +122,14 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void build_lights_tile_(lv_obj_t *tile);   // LVGL task only
   void refresh_lights_ui_();                 // LVGL task only
 
+  // --- audio (chime near expiry) ---
+  void audio_setup_();                         // init I2S speaker codec + play task
+  static void audio_task_trampoline_(void *arg);
+  void audio_task_run_();                      // dedicated task: blocks until signalled
+  void play_chime_(int type);                  // 1 = per-minute, 2 = finish (blocking)
+  void play_tone_(int freq_hz, int ms, float gain);  // one enveloped sine tone
+  void request_chime_(int type);               // signal the audio task (non-blocking)
+
   // --- config ---
   std::string run_script_{"script.patio_heater_run"};
   std::string stop_script_{"script.patio_heater_stop"};
@@ -166,6 +177,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
 
   // --- cross-task state (atomics) ---
   std::atomic<int> setpoint_minutes_{30};     // desired run length
+  int default_minutes_{30};                   // configured default; picker resets here when idle
   std::atomic<int> countdown_secs_{-1};       // remaining secs when active, else -1
   // Absolute UTC epoch the active HA timer finishes at (0 = unknown). When set
   // and the device clock is valid, the countdown is derived from this each tick
@@ -177,6 +189,12 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // of waiting ~30 s for HA to reconnect and re-push the timer state.
   ESPPreferenceObject finishes_pref_;
   void persist_finishes_at_(long epoch);
+
+  // --- audio state ---
+  void *spk_codec_{nullptr};                  // esp_codec_dev_handle_t (opaque here)
+  void *audio_task_{nullptr};                 // FreeRTOS TaskHandle_t (opaque here)
+  std::atomic<int> pending_chime_{0};         // 1 = per-minute, 2 = finish, 0 = none
+  int prev_remaining_{-1};                     // LVGL-task-only: last tick's remaining, for edge detection
   std::atomic<bool> active_{false};           // HA timer is running
   std::atomic<int> pending_start_{-1};        // minutes to start, -1 = none
   std::atomic<int> pending_extend_secs_{-1};  // new total secs for timer.start, -1 = none
