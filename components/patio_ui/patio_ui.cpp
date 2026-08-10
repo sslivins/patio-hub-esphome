@@ -34,6 +34,37 @@ extern "C" const lv_font_t patio_font_countdown;
 #define COL_HEATER lv_color_hex(0x8A4B1E)
 #define COL_LIGHTS lv_color_hex(0x7A6A1E)
 #define COL_SCREENS lv_color_hex(0x1E5A6E)
+
+// Heater "nearing expiry" fade: the tile background shifts from the normal
+// brown, through amber, to red over the final EXPIRY_FADE_SECS of the run.
+#define COL_HEATER_AMBER lv_color_hex(0xC46A12)
+#define COL_HEATER_RED lv_color_hex(0xB01E10)
+static const int EXPIRY_FADE_SECS = 300;  // start fading in the last 5 minutes
+
+// Linear blend of two RGB colours. f=0 -> a, f=1 -> b.
+static lv_color_t lerp_color(lv_color_t a, lv_color_t b, float f) {
+  if (f < 0.0f)
+    f = 0.0f;
+  if (f > 1.0f)
+    f = 1.0f;
+  uint8_t r = (uint8_t) (a.red + (b.red - a.red) * f);
+  uint8_t g = (uint8_t) (a.green + (b.green - a.green) * f);
+  uint8_t bl = (uint8_t) (a.blue + (b.blue - a.blue) * f);
+  return lv_color_make(r, g, bl);
+}
+
+// Background colour for the heater tile given the seconds remaining. Outside the
+// final window it's the normal brown; inside it eases brown->amber->red.
+static lv_color_t heater_bg_for_remaining(int rem_secs) {
+  if (rem_secs < 0 || rem_secs >= EXPIRY_FADE_SECS)
+    return COL_HEATER;
+  // t: 1.0 at the window start (5 min left) -> 0.0 at expiry.
+  float t = (float) rem_secs / (float) EXPIRY_FADE_SECS;
+  if (t >= 0.5f)
+    return lerp_color(COL_HEATER_AMBER, COL_HEATER, (t - 0.5f) / 0.5f);
+  return lerp_color(COL_HEATER_RED, COL_HEATER_AMBER, t / 0.5f);
+}
+
 #define COL_BTN lv_color_hex(0x2E2E2E)
 #define COL_SCREEN_TILE lv_color_hex(0x14424F)
 #define COL_SEL lv_color_hex(0xFFD54A)
@@ -390,6 +421,13 @@ void PatioUI::refresh_heater_ui_() {
     else
       snprintf(buf, sizeof(buf), "%02d:%02d", m, sec);
     lv_label_set_text(this->heater_value_, buf);
+  }
+
+  // Nearing-expiry indicator: fade the tile background brown->amber->red over
+  // the final EXPIRY_FADE_SECS. Normal brown while idle or with time to spare.
+  if (this->tiles_[0] != nullptr) {
+    lv_color_t bg = active ? heater_bg_for_remaining(this->countdown_secs_.load()) : COL_HEATER;
+    lv_obj_set_style_bg_color(this->tiles_[0], bg, 0);
   }
 
   // Toggle picker vs countdown.
