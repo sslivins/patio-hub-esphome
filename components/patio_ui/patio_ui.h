@@ -155,6 +155,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void refresh_heater_ui_();  // LVGL task only — dial value/sub + arc
   void build_time_tile_(lv_obj_t *tile);     // LVGL task only
   void refresh_time_tile_();                 // LVGL task only — clock + temperature
+  // Onboard BM8563 (PCF8563-compatible) RTC on the BSP's shared I2C bus.
+  void seed_clock_from_rtc_();    // setup: read RTC -> seed system clock (main task)
+  void write_rtc_from_system_();  // persist HA time back to the chip (main task)
   void maybe_auto_revert_();                 // LVGL task only — idle -> clock/heater tile
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
   void update_screen_visual_();              // LVGL task only
@@ -169,6 +172,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::string timer_entity_{"timer.patio_heaters"};
   std::string temp_sensor_{"sensor.usl_environmental_temperature_3"};
   time::RealTimeClock *time_{nullptr};
+  void *rtc_dev_{nullptr};            // i2c_master_dev_handle_t for the BM8563 (0x51)
+  uint32_t last_rtc_write_ms_{0};     // throttles RTC write-back from HA time
   int min_minutes_{5};
   int max_minutes_{480};
 

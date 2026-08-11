@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <sys/time.h>
 
 namespace esphome {
 namespace patio_ui {
@@ -1377,6 +1379,96 @@ void PatioUI::start_screenshot_server_() {
   ESP_LOGI(TAG, "http endpoints on :8080  /screenshot  /status");
 }
 
+// ---- onboard BM8563 RTC (PCF8563-compatible) on the BSP's shared I2C bus ----
+// Register map (BCD): 0x02 sec(+VL bit7) | 0x03 min | 0x04 hour | 0x05 day |
+// 0x06 weekday | 0x07 month(+century bit7) | 0x08 year(00-99). The chip stores
+// UTC. We share the BSP's single I2C master (via bsp_i2c_get_handle) so there
+// is no second-master bus contention — a parallel ESPHome i2c bus on the same
+// pins fails with "I2C software timeout"/bus-recovery, so it must go through the
+// BSP handle exactly like the AXP2101 CHGLED write above.
+static inline uint8_t bcd2dec(uint8_t b) { return (uint8_t) ((b >> 4) * 10 + (b & 0x0F)); }
+static inline uint8_t dec2bcd(uint8_t d) { return (uint8_t) (((d / 10) << 4) | (d % 10)); }
+
+// Days since 1970-01-01 for a UTC civil date (Howard Hinnant's algorithm) — lets
+// us build a UTC epoch without depending on timegm()/timezone state.
+static int64_t days_from_civil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned) (y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097LL + (int64_t) doe - 719468;
+}
+
+void PatioUI::seed_clock_from_rtc_() {
+  i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+  if (bus == nullptr)
+    return;
+  i2c_device_config_t cfg = {};
+  cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+  cfg.device_address = 0x51;  // BM8563
+  cfg.scl_speed_hz = 100000;
+  i2c_master_dev_handle_t dev = nullptr;
+  if (i2c_master_bus_add_device(bus, &cfg, &dev) != ESP_OK) {
+    ESP_LOGW(TAG, "RTC: add_device failed; clock will wait for HA");
+    return;
+  }
+  this->rtc_dev_ = dev;  // kept for periodic write-back from HA time
+
+  uint8_t reg = 0x02;
+  uint8_t b[7] = {0};
+  if (i2c_master_transmit_receive(dev, &reg, 1, b, sizeof(b), 1000) != ESP_OK) {
+    ESP_LOGW(TAG, "RTC: read failed; clock will wait for HA");
+    return;
+  }
+  bool vl = (b[0] & 0x80) != 0;  // voltage-low: time integrity not guaranteed
+  int sec = bcd2dec(b[0] & 0x7F);
+  int minute = bcd2dec(b[1] & 0x7F);
+  int hour = bcd2dec(b[2] & 0x3F);
+  int mday = bcd2dec(b[3] & 0x3F);
+  int mon = bcd2dec(b[5] & 0x1F);       // 1..12
+  int year = 2000 + bcd2dec(b[6]);      // century bit ignored (base 2000)
+  if (vl || year < 2021 || mon < 1 || mon > 12 || mday < 1 || mday > 31) {
+    ESP_LOGW(TAG, "RTC: time not trustworthy (VL=%d %04d-%02d-%02d); waiting for HA", vl, year, mon, mday);
+    return;
+  }
+  int64_t epoch = days_from_civil(year, (unsigned) mon, (unsigned) mday) * 86400LL + hour * 3600 + minute * 60 + sec;
+  if (epoch <= 0)
+    return;
+  struct timeval tv = {};
+  tv.tv_sec = (time_t) epoch;
+  settimeofday(&tv, nullptr);
+  ESP_LOGI(TAG, "RTC: seeded system clock %04d-%02d-%02d %02d:%02d:%02d UTC", year, mon, mday, hour, minute, sec);
+}
+
+void PatioUI::write_rtc_from_system_() {
+  if (this->rtc_dev_ == nullptr || this->time_ == nullptr)
+    return;
+  auto now = this->time_->now();
+  if (!now.is_valid())
+    return;
+  time_t epoch = (time_t) now.timestamp;  // UTC
+  struct tm t;
+  gmtime_r(&epoch, &t);
+  auto dev = (i2c_master_dev_handle_t) this->rtc_dev_;
+  // Ensure the oscillator runs (Control1 STOP bit clear) before writing time.
+  const uint8_t ctrl1_run[] = {0x00, 0x00};
+  i2c_master_transmit(dev, ctrl1_run, sizeof(ctrl1_run), 1000);
+  uint8_t buf[8];
+  buf[0] = 0x02;  // auto-incrementing start register
+  buf[1] = dec2bcd(t.tm_sec) & 0x7F;   // clears VL
+  buf[2] = dec2bcd(t.tm_min) & 0x7F;
+  buf[3] = dec2bcd(t.tm_hour) & 0x3F;
+  buf[4] = dec2bcd(t.tm_mday) & 0x3F;
+  buf[5] = (uint8_t) (t.tm_wday & 0x07);
+  buf[6] = (dec2bcd(t.tm_mon + 1) & 0x1F) | 0x80;  // century bit -> 20xx
+  buf[7] = dec2bcd((t.tm_year + 1900) - 2000);
+  if (i2c_master_transmit(dev, buf, sizeof(buf), 1000) != ESP_OK)
+    ESP_LOGW(TAG, "RTC: write-back failed");
+  else
+    ESP_LOGD(TAG, "RTC: persisted HA time to chip");
+}
+
 void PatioUI::setup() {
   ESP_LOGI(TAG, "bringing up Core2 display + LVGL");
 
@@ -1424,6 +1516,11 @@ void PatioUI::setup() {
       }
     }
   }
+
+  // Seed the system clock from the battery-backed BM8563 RTC so the time tile
+  // (and the persisted-timer restore below) has a valid wall clock immediately,
+  // instead of waiting ~seconds for WiFi + the Home Assistant time sync.
+  this->seed_clock_from_rtc_();
 
   bsp_display_lock(0);
   this->build_ui_();
@@ -1507,6 +1604,16 @@ void PatioUI::setup() {
 }
 
 void PatioUI::loop() {
+  // Keep the battery-backed RTC in sync with HA time: write once shortly after
+  // boot (also clears the STOP/VL flags so it ticks) and every ~5 min after.
+  if (this->rtc_dev_ != nullptr && this->time_ != nullptr && this->time_->now().is_valid()) {
+    uint32_t nowms = millis();
+    if (this->last_rtc_write_ms_ == 0 || (nowms - this->last_rtc_write_ms_) >= 300000UL) {
+      this->write_rtc_from_system_();
+      this->last_rtc_write_ms_ = nowms;
+    }
+  }
+
   // Drain button intents on the main task, where the native API lives.
   int start_m = this->pending_start_.exchange(-1);
   if (start_m >= 0) {
