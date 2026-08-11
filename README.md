@@ -231,5 +231,6 @@ port (this also sidesteps the internal-I²C ownership issue below):
 - [x] Live screen-capture PNG endpoint (`:8080/screenshot`)
 - [x] CoreS3 build target (variant switch, shared package) — compiles clean
 - [ ] CoreS3 runtime bring-up (panel/touch/LED) — needs hardware
-- [ ] Wake-on-approach via external presence sensor (mmWave/PIR) + backlight sleep
+- [ ] Screen sleep + **touch-to-wake** (backlight off after idle; first tap wakes
+      only and is swallowed — no button/tile action fires). Works on Core2 today.
 - [ ] Point screen slots at the real Sun Peaks Somfy screen covers
