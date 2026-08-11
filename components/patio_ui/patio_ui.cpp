@@ -17,6 +17,7 @@
 #include "png_uncompressed.h"
 
 #include "esphome/core/application.h"
+#include "esphome/components/network/util.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -400,6 +401,24 @@ void PatioUI::build_time_tile_(lv_obj_t *tile) {
   lv_obj_set_style_text_font(this->temp_label_, &lv_font_montserrat_48, 0);
   lv_label_set_text(this->temp_label_, "--\u00B0C");
   lv_obj_align(this->temp_label_, LV_ALIGN_BOTTOM_MID, 0, -40);
+
+  // Top-corner status icons. Both start hidden and are only shown in their
+  // alert state by refresh_status_icons_(): the WiFi glyph (top-left, red)
+  // appears only when the network is down; the battery glyph + % (top-right)
+  // appears only while the unit is running on battery.
+  this->status_wifi_ = lv_label_create(tile);
+  lv_label_set_text(this->status_wifi_, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_font(this->status_wifi_, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(this->status_wifi_, lv_color_hex(0xFF5555), 0);
+  lv_obj_align(this->status_wifi_, LV_ALIGN_TOP_LEFT, 6, 6);
+  lv_obj_add_flag(this->status_wifi_, LV_OBJ_FLAG_HIDDEN);
+
+  this->status_batt_ = lv_label_create(tile);
+  lv_label_set_text(this->status_batt_, LV_SYMBOL_BATTERY_FULL);
+  lv_obj_set_style_text_font(this->status_batt_, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(this->status_batt_, lv_color_white(), 0);
+  lv_obj_align(this->status_batt_, LV_ALIGN_TOP_RIGHT, -6, 6);
+  lv_obj_add_flag(this->status_batt_, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Repaints the clock (12-hour) and outside temperature. LVGL task only.
@@ -431,6 +450,112 @@ void PatioUI::refresh_time_tile_() {
       lv_label_set_text(this->temp_label_, "--\u00B0C");
     }
   }
+  this->refresh_status_icons_();
+}
+
+// Update the clock-tile status icons from the polled atomics. LVGL task only.
+void PatioUI::refresh_status_icons_() {
+  if (this->status_wifi_ != nullptr) {
+    if (this->wifi_up_.load())
+      lv_obj_add_flag(this->status_wifi_, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_clear_flag(this->status_wifi_, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (this->status_batt_ != nullptr) {
+    if (!this->on_battery_.load()) {
+      lv_obj_add_flag(this->status_batt_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      int pct = this->batt_pct_.load();
+      const char *sym;
+      if (pct < 0)
+        sym = LV_SYMBOL_BATTERY_EMPTY;
+      else if (pct >= 90)
+        sym = LV_SYMBOL_BATTERY_FULL;
+      else if (pct >= 65)
+        sym = LV_SYMBOL_BATTERY_3;
+      else if (pct >= 40)
+        sym = LV_SYMBOL_BATTERY_2;
+      else if (pct >= 15)
+        sym = LV_SYMBOL_BATTERY_1;
+      else
+        sym = LV_SYMBOL_BATTERY_EMPTY;
+      char buf[24];
+      if (pct >= 0)
+        snprintf(buf, sizeof(buf), "%s %d%%", sym, pct);
+      else
+        snprintf(buf, sizeof(buf), "%s", sym);
+      lv_label_set_text(this->status_batt_, buf);
+      lv_obj_set_style_text_color(this->status_batt_,
+                                  (pct >= 0 && pct < 15) ? lv_color_hex(0xFF5555) : lv_color_white(), 0);
+      lv_obj_clear_flag(this->status_batt_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+// Main task: read power/battery from the AXP2101 and the network state, stash
+// into atomics for the LVGL task. Runs throttled from loop().
+void PatioUI::poll_power_status_() {
+  this->wifi_up_.store(network::is_connected());
+
+  if (this->axp_dev_ == nullptr)
+    return;
+  auto dev = static_cast<i2c_master_dev_handle_t>(this->axp_dev_);
+  uint8_t reg, val;
+  int raw_status = -1, raw_gauge = -1, mv = -1;
+
+  // STATUS1 (0x00) bit5 = VBUS present. On battery == no VBUS.
+  reg = 0x00;
+  if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1, 200) == ESP_OK) {
+    raw_status = val;
+    this->on_battery_.store((val & 0x20) == 0);
+  }
+
+  // Fuel-gauge percentage (reg 0xA4). Some units leave the gauge disabled and
+  // return 0/255 — fall back to a voltage-based estimate in that case.
+  reg = 0xA4;
+  if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1, 200) == ESP_OK)
+    raw_gauge = val;
+
+  // Battery voltage (regs 0x34/0x35, H6L8 -> mV) as the fallback source.
+  {
+    uint8_t rh = 0x34, rl = 0x35, vh = 0, vl = 0;
+    if (i2c_master_transmit_receive(dev, &rh, 1, &vh, 1, 200) == ESP_OK &&
+        i2c_master_transmit_receive(dev, &rl, 1, &vl, 1, 200) == ESP_OK)
+      mv = ((vh & 0x3F) << 8) | vl;
+  }
+
+  int pct = -1;
+  if (raw_gauge >= 1 && raw_gauge <= 100)
+    pct = raw_gauge;
+  else if (mv > 2000)
+    pct = PatioUI::batt_mv_to_pct_(mv);
+  if (pct >= 0)
+    this->batt_pct_.store(pct);
+
+  ESP_LOGD(TAG, "power: net=%d status1=0x%02X on_batt=%d gauge=%d mv=%d pct=%d",
+           (int) this->wifi_up_.load(), raw_status, (int) this->on_battery_.load(), raw_gauge, mv,
+           this->batt_pct_.load());
+}
+
+// Rough single-cell LiPo state-of-charge from resting voltage (mV). Only used
+// when the AXP fuel gauge (reg 0xA4) is unavailable.
+int PatioUI::batt_mv_to_pct_(int mv) {
+  static const int lut[][2] = {
+      {4200, 100}, {4100, 90}, {4000, 78}, {3900, 63}, {3800, 48},
+      {3700, 32},  {3600, 18}, {3500, 8},  {3300, 0},
+  };
+  const int n = sizeof(lut) / sizeof(lut[0]);
+  if (mv >= lut[0][0])
+    return 100;
+  if (mv <= lut[n - 1][0])
+    return 0;
+  for (int i = 0; i < n - 1; i++) {
+    int hv = lut[i][0], hp = lut[i][1];
+    int lv = lut[i + 1][0], lp = lut[i + 1][1];
+    if (mv <= hv && mv >= lv)
+      return lp + (mv - lv) * (hp - lp) / (hv - lv);
+  }
+  return 0;
 }
 
 // After IDLE_REVERT_MS with no touch, drift back to the clock tile — unless a
@@ -1512,7 +1637,14 @@ void PatioUI::setup() {
         const uint8_t chgled_off[] = {0x69, 0x00};
         if (i2c_master_transmit(axp, chgled_off, sizeof(chgled_off), 1000) != ESP_OK)
           ESP_LOGW(TAG, "failed to disable CHGLED");
-        i2c_master_bus_rm_device(axp);
+        // Enable the battery-voltage ADC (ADC channel ctrl reg 0x30, bit0) so
+        // the voltage read used as a battery-percentage fallback is valid.
+        uint8_t reg30 = 0x30, adcen = 0;
+        if (i2c_master_transmit_receive(axp, &reg30, 1, &adcen, 1, 1000) == ESP_OK) {
+          const uint8_t w[] = {0x30, (uint8_t) (adcen | 0x01)};
+          i2c_master_transmit(axp, w, sizeof(w), 1000);
+        }
+        this->axp_dev_ = axp;  // kept for periodic battery/power polling in loop()
       }
     }
   }
@@ -1611,6 +1743,16 @@ void PatioUI::loop() {
     if (this->last_rtc_write_ms_ == 0 || (nowms - this->last_rtc_write_ms_) >= 300000UL) {
       this->write_rtc_from_system_();
       this->last_rtc_write_ms_ = nowms;
+    }
+  }
+
+  // Poll battery/power (AXP2101) and network state on a light cadence; the
+  // clock-tile status icons read the resulting atomics on the LVGL task.
+  {
+    uint32_t nowms = millis();
+    if (this->last_status_poll_ms_ == 0 || (nowms - this->last_status_poll_ms_) >= 3000UL) {
+      this->poll_power_status_();
+      this->last_status_poll_ms_ = nowms;
     }
   }
 

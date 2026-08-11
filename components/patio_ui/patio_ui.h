@@ -158,6 +158,10 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // Onboard BM8563 (PCF8563-compatible) RTC on the BSP's shared I2C bus.
   void seed_clock_from_rtc_();    // setup: read RTC -> seed system clock (main task)
   void write_rtc_from_system_();  // persist HA time back to the chip (main task)
+  // Battery/power + network status for the clock-tile corner icons.
+  void poll_power_status_();      // main task: read AXP2101 + network -> atomics
+  void refresh_status_icons_();   // LVGL task: update the WiFi/battery icons
+  static int batt_mv_to_pct_(int mv);  // rough LiPo SoC from resting mV
   void maybe_auto_revert_();                 // LVGL task only — idle -> clock/heater tile
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
   void update_screen_visual_();              // LVGL task only
@@ -174,6 +178,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   time::RealTimeClock *time_{nullptr};
   void *rtc_dev_{nullptr};            // i2c_master_dev_handle_t for the BM8563 (0x51)
   uint32_t last_rtc_write_ms_{0};     // throttles RTC write-back from HA time
+  void *axp_dev_{nullptr};            // i2c_master_dev_handle_t for the AXP2101 (0x34)
+  uint32_t last_status_poll_ms_{0};   // throttles battery/power/network polling
   int min_minutes_{5};
   int max_minutes_{480};
 
@@ -198,6 +204,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   lv_obj_t *time_big_{nullptr};    // large 12-hour H:MM
   lv_obj_t *time_ampm_{nullptr};   // AM/PM
   lv_obj_t *temp_label_{nullptr};  // outside temperature (°C)
+  lv_obj_t *status_wifi_{nullptr}; // "not connected" WiFi icon (clock tile, only when network down)
+  lv_obj_t *status_batt_{nullptr}; // battery icon + % (clock tile, only when on battery)
 
   // screen tile widgets (LVGL task only)
   lv_obj_t *screen_btn_[NUM_SCREENS]{};
@@ -272,6 +280,12 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::atomic<bool> temp_is_f_{false};    // native unit is °F -> convert to °C for display
   std::atomic<bool> temp_valid_{false};   // false until a numeric value arrives
   std::atomic<bool> temp_dirty_{true};    // HA changed -> refresh the label
+
+  // clock tile: power/network status for the top-corner icons. Polled on the
+  // main task from the AXP2101 + network state, drawn on the LVGL task.
+  std::atomic<bool> wifi_up_{true};       // network (WiFi) currently connected
+  std::atomic<bool> on_battery_{false};   // running on battery (no VBUS)
+  std::atomic<int> batt_pct_{-1};         // battery charge 0..100, -1 = unknown
 
   // media tile: Sonos amp state (HA -> UI) + pending intents (UI -> HA).
   std::atomic<int> media_state_{0};       // 0 idle/stopped, 1 playing, 2 paused
