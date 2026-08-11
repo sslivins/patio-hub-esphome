@@ -34,6 +34,12 @@ static const char *const TAG = "patio_ui";
 // C in patio_font_countdown.c, so it needs C linkage here.
 extern "C" const lv_font_t patio_font_countdown;
 
+// Single-glyph MDI "wifi-off" font (U+F05AA) for the not-connected icon, also
+// generated with lv_font_conv (patio_font_wifi_off.c). UTF-8 for U+F05AA is the
+// 4-byte sequence below.
+extern "C" const lv_font_t patio_font_wifi_off;
+#define PATIO_WIFI_OFF_SYMBOL "\xF3\xB0\x96\xAA"
+
 // --- palette (matches the native PoC) ---
 #define COL_HEATER lv_color_hex(0x8A4B1E)
 #define COL_LIGHTS lv_color_hex(0x7A6A1E)
@@ -407,8 +413,8 @@ void PatioUI::build_time_tile_(lv_obj_t *tile) {
   // appears only when the network is down; the battery glyph + % (top-right)
   // appears only while the unit is running on battery.
   this->status_wifi_ = lv_label_create(tile);
-  lv_label_set_text(this->status_wifi_, LV_SYMBOL_WIFI);
-  lv_obj_set_style_text_font(this->status_wifi_, &lv_font_montserrat_20, 0);
+  lv_label_set_text(this->status_wifi_, PATIO_WIFI_OFF_SYMBOL);
+  lv_obj_set_style_text_font(this->status_wifi_, &patio_font_wifi_off, 0);
   lv_obj_set_style_text_color(this->status_wifi_, lv_color_hex(0xFF5555), 0);
   lv_obj_align(this->status_wifi_, LV_ALIGN_TOP_LEFT, 6, 6);
   lv_obj_add_flag(this->status_wifi_, LV_OBJ_FLAG_HIDDEN);
