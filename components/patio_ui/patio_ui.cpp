@@ -100,6 +100,13 @@ static void ev_cover_stop(lv_event_t *e) {
 static void ev_tile_scroll(lv_event_t *e) {  // active tile changed -> update dots
   static_cast<PatioUI *>(lv_event_get_user_data(e))->update_page_dots_();
 }
+static void ev_gesture(lv_event_t *e) {  // swipe up anywhere -> jump to the clock tile
+  lv_indev_t *indev = lv_indev_active();
+  if (indev == nullptr)
+    return;
+  if (lv_indev_get_gesture_dir(indev) == LV_DIR_TOP)
+    static_cast<PatioUI *>(lv_event_get_user_data(e))->go_home_tile();
+}
 static void ev_light_slider(lv_event_t *e) {  // dim fader released -> push brightness
   auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
   int v = lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e)));
@@ -233,6 +240,12 @@ void PatioUI::build_ui_() {
   this->tiles_[TILE_SCREENS] = t_screens;
   this->tiles_[TILE_MEDIA] = t_media;
 
+  // Bubble touch gestures up to the tileview/screen so a swipe on any tile body
+  // reaches ev_gesture (attached to the screen below).
+  for (int i = 0; i < NUM_TILES; i++)
+    lv_obj_add_flag(this->tiles_[i], LV_OBJ_FLAG_EVENT_BUBBLE);
+  lv_obj_add_flag(tv, LV_OBJ_FLAG_EVENT_BUBBLE);
+
   // --- clock + outside-temperature tile (the resting/idle screen) ---
   this->build_time_tile_(t_time);
 
@@ -323,6 +336,7 @@ void PatioUI::build_ui_() {
   }
   lv_obj_add_event_cb(tv, ev_tile_scroll, LV_EVENT_VALUE_CHANGED, this);
   lv_obj_add_event_cb(tv, ev_tile_scroll, LV_EVENT_SCROLL_END, this);
+  lv_obj_add_event_cb(scr, ev_gesture, LV_EVENT_GESTURE, this);
   this->update_page_dots_();
 
   // 1 Hz refresh/countdown driver (LVGL task)
@@ -431,6 +445,16 @@ void PatioUI::maybe_auto_revert_() {
   if (lv_tileview_get_tile_active(this->tv_) == this->tiles_[target])
     return;
   lv_tileview_set_tile(this->tv_, this->tiles_[target], LV_ANIM_ON);
+  this->update_page_dots_();
+}
+
+// Swipe-up gesture -> jump straight back to the clock (first) tile. LVGL task only.
+void PatioUI::go_home_tile() {
+  if (this->tv_ == nullptr || this->tiles_[TILE_TIME] == nullptr)
+    return;
+  if (lv_tileview_get_tile_active(this->tv_) == this->tiles_[TILE_TIME])
+    return;
+  lv_tileview_set_tile(this->tv_, this->tiles_[TILE_TIME], LV_ANIM_ON);
   this->update_page_dots_();
 }
 
@@ -904,8 +928,8 @@ void PatioUI::build_media_tile_(lv_obj_t *tile) {
   lv_obj_align(vicon, LV_ALIGN_TOP_LEFT, 14, 104);
 
   this->media_vol_slider_ = lv_slider_create(tile);
-  lv_obj_set_size(this->media_vol_slider_, 210, 12);
-  lv_obj_align(this->media_vol_slider_, LV_ALIGN_TOP_MID, 6, 108);
+  lv_obj_set_size(this->media_vol_slider_, 189, 12);
+  lv_obj_align(this->media_vol_slider_, LV_ALIGN_TOP_LEFT, 51, 108);
   lv_slider_set_range(this->media_vol_slider_, 0, 100);
   lv_slider_set_value(this->media_vol_slider_, 0, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(this->media_vol_slider_, lv_color_hex(0x2A1C3E), LV_PART_MAIN);

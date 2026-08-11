@@ -124,6 +124,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void request_media_cmd(int cmd);        // 1=play/pause, 2=next, 3=prev
   void request_media_volume(int pct);     // 0..100
   void update_media_vol_label_(int pct);  // LVGL task — live "NN%" while dragging
+  void go_home_tile();                    // LVGL task — swipe up -> clock tile
 
  protected:
   // --- display / UI bring-up ---
