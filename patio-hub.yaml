@@ -1,17 +1,21 @@
 # ============================================================================
-# Patio Hub  (M5Stack Core2 v1.1)  —  HYBRID native-LVGL build
+# Patio Hub  —  M5Stack Core2 v1.1  (HYBRID native-LVGL build)
 #
 # ESPHome owns WiFi / native API / OTA / logging. The `patio_ui` external
 # component owns the WHOLE display stack itself (esp_lcd + esp_lvgl_port DMA
-# flush via the M5Stack Core2 BSP), giving the smooth, native-feeling swipe UI
-# that ESPHome's own mipi_spi + lvgl pipeline cannot (blocking polled SPI +
+# flush via the M5Stack BSP), giving the smooth, native-feeling swipe UI that
+# ESPHome's own mipi_spi + lvgl pipeline cannot (blocking polled SPI +
 # single-buffered synchronous flush).
 #
 # We therefore DO NOT declare `display:`, `lvgl:`, `i2c:`, `touchscreen:` or an
 # axp2101 component here — the component is the single owner of I2C, the panel,
 # the PMIC power rails and the one LVGL instance.
 #
-# The heater tile drives the HA patio-heater timer through the native API.
+# All board-INDEPENDENT config (WiFi, API, OTA, the patio_ui block with its
+# screens/lights/media entities) lives in common/patio-hub-common.yaml. This
+# entrypoint adds only the Core2-specific board + PSRAM. The CoreS3 build is
+# the sibling patio-hub-cores3.yaml.
+#
 # NOTE: enable "Allow the device to perform Home Assistant actions" on this
 # device's ESPHome integration in HA, or Start/Stop won't call the scripts.
 # ============================================================================
@@ -34,87 +38,7 @@ psram:
   mode: quad
   speed: 80MHz
 
-external_components:
-  - source:
-      type: local
-      path: components
-    components: [patio_ui]
+packages:
+  common: !include common/patio-hub-common.yaml
 
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  ap:
-    ssid: "Patio Hub Fallback"
-
-captive_portal:
-
-logger:
-  level: DEBUG
-  # UART0 shares pins with USB-serial on the Core2; keep hardware UART logging.
-
-api:
-  encryption:
-    key: !secret core2_patio_api_key
-  # Required for the patio_ui component's native-API bridge:
-  #   homeassistant_states   -> subscribe_homeassistant_state() (timer countdown)
-  #   homeassistant_services -> call_homeassistant_service()     (Start/Stop)
-  homeassistant_states: true
-  homeassistant_services: true
-
-ota:
-  - platform: esphome
-    password: !secret core2_patio_ota_password
-
-# Device clock, synced from Home Assistant (single source of truth — same clock
-# as the timer's `finishes_at`, LAN-reliable at the remote site).
-time:
-  - platform: homeassistant
-    id: ha_time
-
-# The native-LVGL patio UI + Home Assistant heater-timer bridge.
-patio_ui:
-  id: patio_hub_ui
-  timer_entity: timer.patio_heaters
-  time_id: ha_time
-  # Outside temperature shown on the clock tile. Displayed in °C (the component
-  # converts from °F when the sensor reports Fahrenheit). Currently a Mercer
-  # Island stand-in outdoor sensor; swap to sensor.usl_environmental_temperature_3
-  # once the device's HA can reach the Sun Peaks instance.
-  temp_sensor: sensor.outdoor_kitchen_sensor_temperature
-  run_script: script.patio_heater_run
-  stop_script: script.patio_heater_stop
-  default_minutes: 30
-  min_minutes: 15
-  max_minutes: 60
-  # Perimeter screen map (as seen standing in front of the Core2):
-  #   left / right      -> the single side screens
-  #   rear_left/rear_right -> the two side-by-side screens on the wall behind you
-  # Stand-in covers on the Mercer Island HA (office shades) until the real
-  # Sun Peaks Caseta screen covers exist; just swap the entity_id later.
-  screens:
-    left:
-      entity_id: cover.office_front_left_shade
-      label: "Left"
-    right:
-      entity_id: cover.office_front_right_shade
-      label: "Right"
-    rear_left:
-      entity_id: cover.office_front_center_shade
-      label: "Rear Left"
-    rear_right:
-      entity_id: cover.office_door_shade
-      label: "Rear Right"
-  # Patio light groups shown as two vertical dim faders (Main | BBQ).
-  # Stand-in office lights on the Mercer Island HA until the real Sun Peaks
-  # patio light groups exist; just swap the entity_id later.
-  lights:
-    main:
-      entity_id: light.office_ceiling_over_desk
-      label: "Main"
-    bbq:
-      entity_id: light.office_ceiling_over_couch
-      label: "BBQ"
-  # Deck Sonos amp: volume + play/pause/prev/next on the Music tile.
-  media:
-    entity_id: media_player.sonos_amp
-    label: "Music"
+# patio_ui `variant` defaults to core2, so no override is needed here.

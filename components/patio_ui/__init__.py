@@ -45,12 +45,39 @@ LIGHT_DEFAULT_LABELS = {
 #     IDF >=5.5 with no scl_speed_hz patch, and
 #   * includes our Core2 v1.1 AXP2101 ALDO2 LCD/touch reset-pulse fix, so the
 #     panel comes up (no blank screen) with the BSP doing power + reset itself.
-# Only the bsp/m5stack_core_2 folder is pulled; its registry dependencies
-# (esp_lvgl_port -> LVGL 9, esp_lcd_ili9341, esp_lcd_touch_ft5x06) are resolved
-# by the IDF component manager at build time.
+# Only the selected board's bsp/<board> folder is pulled; its registry
+# dependencies (esp_lvgl_port -> LVGL 9, esp_lcd_* , esp_lcd_touch_*) are
+# resolved by the IDF component manager at build time.
+#
+# The C++ component only ever talks to the generic esp-bsp API (bsp_display_*,
+# bsp_i2c_get_handle) via <bsp/esp-bsp.h>, so switching boards is purely a
+# matter of pulling a different bsp/<board> component + a couple of board
+# sdkconfig options — no source changes.
 ESP_BSP_REPO = "https://github.com/sslivins/esp-bsp.git"
 ESP_BSP_REF = "696ef8657e2b48f849e83c3726c2e69cad18b41d"
-ESP_BSP_PATH = "bsp/m5stack_core_2"
+
+# Supported M5Stack boards. `variant` (default core2) selects which esp-bsp
+# board component gets pulled and any board-specific sdkconfig. Both boards use
+# the same 320x240 panel + AXP2101 PMU, so the whole UI layer is identical.
+BSP_VARIANTS = {
+    "core2": {
+        "component": "m5stack_core_2",
+        "path": "bsp/m5stack_core_2",
+        "repo": ESP_BSP_REPO,
+        "ref": ESP_BSP_REF,
+        "axp2101": True,   # Core2 v1.1 PMU
+    },
+    "cores3": {
+        "component": "m5stack_core_s3",
+        "path": "bsp/m5stack_core_s3",
+        # Same fork commit for now (it mirrors the whole esp-bsp tree). If the
+        # CoreS3 folder needs its own fix, point repo/ref at a dedicated branch.
+        "repo": ESP_BSP_REPO,
+        "ref": ESP_BSP_REF,
+        "axp2101": True,   # CoreS3 also uses an AXP2101 (+ an AW9523 expander)
+    },
+}
+CONF_VARIANT = "variant"
 
 patio_ui_ns = cg.esphome_ns.namespace("patio_ui")
 PatioUI = patio_ui_ns.class_("PatioUI", cg.Component)
@@ -80,6 +107,9 @@ MEDIA_SCHEMA = cv.Schema(
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(PatioUI),
+        cv.Optional(CONF_VARIANT, default="core2"): cv.one_of(
+            *BSP_VARIANTS, lower=True
+        ),
         cv.Optional(CONF_RUN_SCRIPT, default="script.patio_heater_run"): cv.string,
         cv.Optional(CONF_STOP_SCRIPT, default="script.patio_heater_stop"): cv.string,
         cv.Optional(CONF_TIMER_ENTITY, default="timer.patio_heaters"): cv.string,
@@ -137,16 +167,20 @@ async def to_code(config):
         cg.add(var.set_media_entity(media[CONF_ENTITY_ID]))
         cg.add(var.set_media_label(media[CONF_LABEL]))
 
-    # Pull the M5Stack Core2 BSP (esp_lcd + esp_lvgl_port DMA flush + touch).
+    # Pull the selected M5Stack board's BSP (esp_lcd + esp_lvgl_port DMA flush
+    # + touch). The C++ only uses the generic <bsp/esp-bsp.h> API, so the board
+    # is chosen entirely here via `variant`.
+    bsp = BSP_VARIANTS[config[CONF_VARIANT]]
     esp32.add_idf_component(
-        name="m5stack_core_2",
-        repo=ESP_BSP_REPO,
-        ref=ESP_BSP_REF,
-        path=ESP_BSP_PATH,
+        name=bsp["component"],
+        repo=bsp["repo"],
+        ref=bsp["ref"],
+        path=bsp["path"],
     )
 
     # --- board / performance ---
-    esp32.add_idf_sdkconfig_option("CONFIG_BSP_PMU_AXP2101", True)  # Core2 v1.1 PMU
+    if bsp["axp2101"]:
+        esp32.add_idf_sdkconfig_option("CONFIG_BSP_PMU_AXP2101", True)  # AXP2101 PMU
     esp32.add_idf_sdkconfig_option("CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240", True)
     esp32.add_idf_sdkconfig_option("CONFIG_FREERTOS_HZ", 1000)
 

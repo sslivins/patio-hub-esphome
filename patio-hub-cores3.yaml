@@ -1,0 +1,47 @@
+# ============================================================================
+# Patio Hub  —  M5Stack CoreS3  (HYBRID native-LVGL build)
+#
+# Sibling of patio-hub.yaml (Core2). Everything board-INDEPENDENT lives in
+# common/patio-hub-common.yaml; this entrypoint only swaps in the CoreS3
+# board + its OCTAL PSRAM, and flips the patio_ui `variant` to cores3 so the
+# component pulls the m5stack_core_s3 BSP instead of the Core2 one.
+#
+# The CoreS3 shares the Core2's 320x240 panel + AXP2101 PMU, so the entire UI
+# layer (tiles, fonts, HA bridge, screenshot server) is byte-for-byte the same
+# code — only the BSP under it differs.
+#
+# A distinct `name` (patio-hub-s3) keeps it from colliding with the live Core2
+# on mDNS / in Home Assistant while both are on the bench. Rename to `patio-hub`
+# once the CoreS3 permanently replaces the Core2.
+#
+# FIRST FLASH MUST BE WIRED USB (a blank board can't OTA); the CoreS3's USB-C
+# port connects straight to the ESP32-S3. After the first flash, OTA works as
+# it does on the Core2.
+# ============================================================================
+substitutions:
+  name: patio-hub-s3
+  friendly_name: Patio Hub S3
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: m5stack-cores3
+  framework:
+    type: esp-idf
+
+# CoreS3 is an ESP32-S3-WROOM-1 N16R8 -> 8 MB *octal* PSRAM (the Core2's `quad`
+# will not boot here).
+psram:
+  mode: octal
+  speed: 80MHz
+
+packages:
+  common: !include common/patio-hub-common.yaml
+
+# Merge just the board variant into the shared patio_ui component (package
+# merging deep-merges this with the common block) so it pulls the CoreS3 BSP;
+# all entity config is inherited from the common package.
+patio_ui:
+  variant: cores3
