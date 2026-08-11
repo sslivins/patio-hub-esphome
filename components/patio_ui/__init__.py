@@ -54,7 +54,10 @@ LIGHT_DEFAULT_LABELS = {
 # matter of pulling a different bsp/<board> component + a couple of board
 # sdkconfig options — no source changes.
 ESP_BSP_REPO = "https://github.com/sslivins/esp-bsp.git"
-ESP_BSP_REF = "696ef8657e2b48f849e83c3726c2e69cad18b41d"
+# PR espressif/esp-bsp#813 head: Core2 v1.1 AXP2101 ALDO2 LCD/touch reset fix
+# (failure-safe read8bit_checked + 20 ms assert / 10 ms release). Validated on
+# hardware 2026-08-11 (10/10 cold boots, incl. battery-pull, panel up every time).
+ESP_BSP_REF = "109814de511756d28a00e02cebdac05c2bd82d16"
 
 # Supported M5Stack boards. `variant` (default core2) selects which esp-bsp
 # board component gets pulled and any board-specific sdkconfig. Both boards use
