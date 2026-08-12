@@ -54,10 +54,13 @@ LIGHT_DEFAULT_LABELS = {
 # matter of pulling a different bsp/<board> component + a couple of board
 # sdkconfig options — no source changes.
 ESP_BSP_REPO = "https://github.com/sslivins/esp-bsp.git"
-# PR espressif/esp-bsp#813 head: Core2 v1.1 AXP2101 ALDO2 LCD/touch reset fix
-# (failure-safe read8bit_checked + 20 ms assert / 10 ms release). Validated on
-# hardware 2026-08-11 (10/10 cold boots, incl. battery-pull, panel up every time).
-ESP_BSP_REF = "109814de511756d28a00e02cebdac05c2bd82d16"
+# PR espressif/esp-bsp#816 head (stacked on #813): Core2 v1.1 AXP2101 fixes.
+#  - #813: failure-safe read8bit_checked + ALDO2 LCD/touch reset (20 ms assert /
+#    10 ms release). Validated on hardware 2026-08-11 (10/10 cold boots, incl.
+#    battery-pull, panel up every time).
+#  - #816: bsp_display_brightness_set owns the BLDO1 backlight rail so 0% fully
+#    cuts the rail (true-off, no ~2.5 V faint glow) and >0% re-enables it.
+ESP_BSP_REF = "1aece77420cf6d89e16f17b42eb67ef06c099075"
 
 # Supported M5Stack boards. `variant` (default core2) selects which esp-bsp
 # board component gets pulled and any board-specific sdkconfig. Both boards use
