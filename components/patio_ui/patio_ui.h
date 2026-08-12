@@ -16,6 +16,8 @@ struct _lv_obj_t;
 typedef struct _lv_obj_t lv_obj_t;
 struct _lv_timer_t;
 typedef struct _lv_timer_t lv_timer_t;
+struct _lv_anim_t;
+typedef struct _lv_anim_t lv_anim_t;
 
 #include "esphome/components/api/custom_api_device.h"
 #include "esphome/components/time/real_time_clock.h"
@@ -54,6 +56,15 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // Revert to the clock tile (or the heater tile if a timer is running) after
   // this much untouched time.
   static constexpr uint32_t IDLE_REVERT_MS = 60000;
+
+  // Turn the backlight off entirely after this much untouched time to avoid
+  // burn-in from the static clock. The next touch is swallowed (just wakes).
+  static constexpr uint32_t SCREEN_SLEEP_MS = 180000;  // 3 min of inactivity -> eyelids close
+
+  // The deliberate eyes-opening sweep on wake uses this duration; the
+  // "fighting sleep" nod-off close durations are baked into the keyframe table
+  // in patio_ui.cpp.
+  static constexpr uint32_t SCREEN_OPEN_MS = 520;  // deliberate eyes-open on wake
 
   // YAML-configurable Home Assistant contract.
   void set_run_script(const std::string &s) { this->run_script_ = s; }
@@ -125,6 +136,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void request_media_volume(int pct);     // 0..100
   void update_media_vol_label_(int pct);  // LVGL task — live "NN%" while dragging
   void go_home_tile();                    // LVGL task — swipe up -> clock tile
+  void wake_screen();                     // LVGL task — backlight on, swallow the waking tap
 
  protected:
   // --- display / UI bring-up ---
@@ -163,6 +175,17 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void refresh_status_icons_();   // LVGL task: update the WiFi/battery icons
   static int batt_mv_to_pct_(int mv);  // rough LiPo SoC from resting mV
   void maybe_auto_revert_();                 // LVGL task only — idle -> clock/heater tile
+  void maybe_screen_sleep_();                // LVGL task only — idle -> fade to black
+  void set_backlight_rail_(bool on);         // AXP2101 BLDO1 rail cut/restore (LVGL task)
+  void set_cpu_freq_(int min_mhz, int max_mhz);  // DFS floor/ceiling via esp_pm (80-240 asleep / 240 awake)
+  static void fade_step_cb_(void *var, int32_t v);  // lv_anim: set both eyelid heights
+  // "Fighting sleep" close: the eyelids droop and snap back a couple of times
+  // (each a keyframe) before finally shutting; then the backlight is cut. Wake
+  // is a single, deliberate eyes-open sweep.
+  void start_sleep_kf_(int idx);                    // LVGL task — run close keyframe #idx
+  static void sleep_kf_done_cb_(lv_anim_t *a);      // lv_anim: advance to the next keyframe
+  void finish_sleep_();                             // LVGL task — eyelids shut: cut rail + drop CPU
+  static void wake_done_cb_(lv_anim_t *a);          // lv_anim: eyelids open -> hide overlays
   void build_screens_tile_(lv_obj_t *tile);  // LVGL task only
   void update_screen_visual_();              // LVGL task only
   void build_lights_tile_(lv_obj_t *tile);   // LVGL task only
@@ -198,6 +221,15 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   lv_obj_t *tv_{nullptr};
   lv_obj_t *tiles_[NUM_TILES]{};
   lv_obj_t *page_dots_[NUM_TILES]{};
+
+  // Screen-sleep (burn-in guard): a full-screen transparent presser on the top
+  // layer, revealed when the backlight is off so the first tap only wakes, plus
+  // two black "eyelid" bars that close from top and bottom to sleep the screen.
+  lv_obj_t *wake_eater_{nullptr};
+  lv_obj_t *eyelid_top_{nullptr};
+  lv_obj_t *eyelid_bottom_{nullptr};
+  bool screen_asleep_{false};  // LVGL task only
+  int sleep_kf_idx_{0};        // current "fighting sleep" close keyframe (LVGL task only)
 
   // clock/temperature tile widgets (LVGL task only)
   lv_obj_t *time_date_{nullptr};   // small header: weekday + date

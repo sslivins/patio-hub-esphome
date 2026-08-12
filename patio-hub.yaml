@@ -33,6 +33,10 @@ esp32:
   board: m5stack-core2
   framework:
     type: esp-idf
+    sdkconfig_options:
+      # Enable the ESP-IDF power-management framework so patio_ui can drop the
+      # CPU to 80 MHz while the screen is asleep (DFS only; no light sleep).
+      CONFIG_PM_ENABLE: y
 
 psram:
   mode: quad

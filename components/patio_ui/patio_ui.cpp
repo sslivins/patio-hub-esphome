@@ -14,6 +14,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_app_desc.h"
+#include "esp_pm.h"
 #include "png_uncompressed.h"
 
 #include "esphome/core/application.h"
@@ -115,6 +116,9 @@ static void ev_gesture(lv_event_t *e) {  // swipe up anywhere -> jump to the clo
     return;
   if (lv_indev_get_gesture_dir(indev) == LV_DIR_TOP)
     static_cast<PatioUI *>(lv_event_get_user_data(e))->go_home_tile();
+}
+static void ev_wake(lv_event_t *e) {  // tap while asleep -> wake, swallow the tap
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->wake_screen();
 }
 static void ev_light_slider(lv_event_t *e) {  // dim fader released -> push brightness
   auto *c = static_cast<PatioUI::LightCtrl *>(lv_event_get_user_data(e));
@@ -347,6 +351,33 @@ void PatioUI::build_ui_() {
   lv_obj_add_event_cb(tv, ev_tile_scroll, LV_EVENT_SCROLL_END, this);
   lv_obj_add_event_cb(scr, ev_gesture, LV_EVENT_GESTURE, this);
   this->update_page_dots_();
+
+  // Full-screen presser on the top layer. Hidden while awake (so it blocks
+  // nothing); revealed when the screen sleeps so the first touch lands here —
+  // waking the screen without also actuating whatever was underneath. Kept
+  // transparent: the visible black is drawn by the two eyelid bars below.
+  this->wake_eater_ = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(this->wake_eater_);
+  lv_obj_set_size(this->wake_eater_, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_opa(this->wake_eater_, LV_OPA_TRANSP, 0);
+  lv_obj_add_flag(this->wake_eater_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(this->wake_eater_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(this->wake_eater_, ev_wake, LV_EVENT_PRESSED, this);
+
+  // Two opaque black "eyelids" on the top layer that close from the top and
+  // bottom edges toward the centre to sleep the screen (heights animated in
+  // fade_step_cb_). Non-clickable so taps fall through to the wake-eater.
+  for (lv_obj_t **lid : {&this->eyelid_top_, &this->eyelid_bottom_}) {
+    *lid = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(*lid);
+    lv_obj_set_width(*lid, LV_PCT(100));
+    lv_obj_set_height(*lid, 0);
+    lv_obj_set_pos(*lid, 0, 0);
+    lv_obj_set_style_bg_color(*lid, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(*lid, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(*lid, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(*lid, LV_OBJ_FLAG_HIDDEN);
+  }
 
   // 1 Hz refresh/countdown driver (LVGL task)
   this->tick_timer_ = lv_timer_create(PatioUI::tick_cb_, 1000, this);
@@ -581,6 +612,176 @@ void PatioUI::maybe_auto_revert_() {
   this->update_page_dots_();
 }
 
+// After SCREEN_SLEEP_MS untouched, close two black "eyelids" from the top and
+// bottom edges toward the centre, then cut the backlight — avoids burn-in from
+// the static clock. The top-layer presser is revealed up front so it swallows
+// the next touch (which only wakes). Inhibited while a heater timer is running
+// (the countdown changes constantly — no burn-in risk — and the remaining time
+// should stay visible). LVGL task only.
+void PatioUI::maybe_screen_sleep_() {
+  if (this->wake_eater_ == nullptr || this->eyelid_top_ == nullptr || this->screen_asleep_)
+    return;
+  if (this->active_.load())
+    return;
+  if (lv_display_get_inactive_time(nullptr) < SCREEN_SLEEP_MS)
+    return;
+  this->screen_asleep_ = true;
+  lv_obj_set_height(this->eyelid_top_, 0);
+  lv_obj_set_height(this->eyelid_bottom_, 0);
+  for (lv_obj_t *o : {this->wake_eater_, this->eyelid_top_, this->eyelid_bottom_}) {
+    lv_obj_move_foreground(o);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+  }
+  this->sleep_kf_idx_ = 0;
+  this->start_sleep_kf_(0);
+  ESP_LOGD(TAG, "screen getting drowsy (eyelids fighting it)");
+}
+
+// One segment of the "fighting sleep" close: animate both eyelids from their
+// current height to keyframe #idx's target, then hand off to sleep_kf_done_cb_
+// which advances to the next segment. The table droops the lids partway and
+// lets them spring back a couple of times (a groggy "nodding off" struggle)
+// before the final full close. Targets are a permille fraction of the
+// half-screen height so they scale with the display. When the table is
+// exhausted the eyelids are shut -> finish_sleep_(). LVGL task only.
+void PatioUI::start_sleep_kf_(int idx) {
+  struct KF {
+    int16_t frac_permille;   // eyelid height as permille of half-screen (0=open, 1000=shut)
+    uint16_t dur_ms;
+    lv_anim_path_cb_t path;  // easing for this segment
+  };
+  static const KF kf[] = {
+      {500, 620, lv_anim_path_ease_in},   // slow droop — starting to give in
+      {120, 150, lv_anim_path_ease_out},  // fast jerk back awake
+      {120, 320, lv_anim_path_linear},    // ...hold, fighting to stay awake
+      {800, 780, lv_anim_path_ease_in},   // heavier, slower droop
+      {250, 160, lv_anim_path_ease_out},  // fast jerk awake again
+      {250, 240, lv_anim_path_linear},    // one last brief hold
+      {1000, 720, lv_anim_path_ease_in},  // can't win — slow final close
+  };
+  static const int kf_n = sizeof(kf) / sizeof(kf[0]);
+  if (idx >= kf_n) {
+    this->finish_sleep_();
+    return;
+  }
+  const int32_t half = (lv_display_get_vertical_resolution(nullptr) + 1) / 2;  // meet, no seam
+  const int32_t from = lv_obj_get_height(this->eyelid_top_);
+  const int32_t to = (int32_t) half * kf[idx].frac_permille / 1000;
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, this);
+  lv_anim_set_values(&a, from, to);
+  lv_anim_set_duration(&a, kf[idx].dur_ms);
+  lv_anim_set_exec_cb(&a, PatioUI::fade_step_cb_);
+  lv_anim_set_completed_cb(&a, PatioUI::sleep_kf_done_cb_);
+  lv_anim_set_path_cb(&a, kf[idx].path);
+  lv_anim_start(&a);
+}
+
+// lv_anim step: grow the two eyelids toward the centre (var == this). The top
+// lid extends down from y=0; the bottom lid's top edge tracks up from the
+// bottom edge so it grows upward.
+void PatioUI::fade_step_cb_(void *var, int32_t v) {
+  auto *self = static_cast<PatioUI *>(var);
+  const int32_t h = lv_display_get_vertical_resolution(nullptr);
+  if (self->eyelid_top_ != nullptr) {
+    lv_obj_set_pos(self->eyelid_top_, 0, 0);
+    lv_obj_set_height(self->eyelid_top_, v);
+  }
+  if (self->eyelid_bottom_ != nullptr) {
+    lv_obj_set_height(self->eyelid_bottom_, v);
+    lv_obj_set_pos(self->eyelid_bottom_, 0, h - v);
+  }
+}
+
+// lv_anim completed for one close segment: advance to the next keyframe. When
+// the table runs out, start_sleep_kf_ calls finish_sleep_.
+void PatioUI::sleep_kf_done_cb_(lv_anim_t *a) {
+  auto *self = static_cast<PatioUI *>(a->var);
+  self->start_sleep_kf_(++self->sleep_kf_idx_);
+}
+
+// Eyelids are fully shut: cut the backlight rail and drop the CPU floor to
+// 80 MHz (ceiling stays 240 so OTA/API bursts still ramp up). WiFi keeps the
+// APB clock locked at 80 MHz, so peripheral timing and touch-wake are
+// unaffected. LVGL task.
+void PatioUI::finish_sleep_() {
+  this->set_backlight_rail_(false);
+  this->set_cpu_freq_(80, 240);
+  ESP_LOGD(TAG, "screen asleep (backlight off)");
+}
+
+// Retained no-op removed: the single-shot close hook was replaced by the
+// keyframe nod-off sequence above (sleep_kf_done_cb_ / finish_sleep_).
+
+// Wake from screen-sleep: back to full speed, backlight on (the shut eyelids
+// still cover the panel), then a single deliberate "eyes open" sweep retracts
+// them to the edges. wake_done_cb_ hides the overlays once fully open. The
+// wake-eater stays up during the sweep so the waking tap (and any taps mid-open)
+// are swallowed rather than actuating a control underneath. LVGL task only
+// (called from the presser's press event).
+void PatioUI::wake_screen() {
+  if (!this->screen_asleep_)
+    return;
+  this->screen_asleep_ = false;                    // re-entrant taps now no-op
+  lv_anim_delete(this, PatioUI::fade_step_cb_);    // stop the nod-off if still closing
+  this->set_cpu_freq_(240, 240);                   // full speed before the redraw
+  this->set_backlight_rail_(true);                 // rail on; eyelids still hide the panel
+  lv_display_trigger_activity(nullptr);            // restart the idle clock from the wake
+  const int32_t from = lv_obj_get_height(this->eyelid_top_);
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, this);
+  lv_anim_set_values(&a, from, 0);
+  lv_anim_set_duration(&a, SCREEN_OPEN_MS);
+  lv_anim_set_exec_cb(&a, PatioUI::fade_step_cb_);
+  lv_anim_set_completed_cb(&a, PatioUI::wake_done_cb_);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);  // decisive, deliberate open
+  lv_anim_start(&a);
+  ESP_LOGD(TAG, "screen waking (eyelids opening)");
+}
+
+// lv_anim completed for the wake sweep: eyelids are fully open, so hide the
+// wake-eater + eyelids and let normal touches through again. LVGL task.
+void PatioUI::wake_done_cb_(lv_anim_t *a) {
+  auto *self = static_cast<PatioUI *>(a->var);
+  for (lv_obj_t *o : {self->wake_eater_, self->eyelid_top_, self->eyelid_bottom_})
+    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+  ESP_LOGD(TAG, "screen awake (backlight on)");
+}
+
+// Configure CPU dynamic-frequency scaling via the ESP-IDF power-management
+// framework (DFS, no light sleep). Pass a floor and ceiling: DFS idles at
+// min_mhz and automatically ramps toward max_mhz under load. Awake we pin
+// 240/240; asleep we use 80/240 so the CPU idles low to save power but can
+// still ramp to full speed for bursty work (OTA, API/HA pushes, WiFi RX) --
+// pinning max to 80 while asleep is what previously stalled OTA. 80 MHz is the
+// floor that keeps APB at 80 MHz so WiFi and I2C/SPI/UART timing stay correct.
+// Requires CONFIG_PM_ENABLE (set in the YAML sdkconfig_options).
+void PatioUI::set_cpu_freq_(int min_mhz, int max_mhz) {
+  esp_pm_config_t pm{};
+  pm.max_freq_mhz = max_mhz;
+  pm.min_freq_mhz = min_mhz;
+  pm.light_sleep_enable = false;
+  esp_err_t err = esp_pm_configure(&pm);
+  if (err != ESP_OK)
+    ESP_LOGW(TAG, "esp_pm_configure(%d-%d MHz) failed: %s", min_mhz, max_mhz, esp_err_to_name(err));
+  else
+    ESP_LOGD(TAG, "cpu freq set to %d-%d MHz", min_mhz, max_mhz);
+}
+
+// Cut or restore the LCD backlight. bsp_display_backlight_off() disables the
+// AXP2101 BLDO1 backlight rail (esp-bsp Core2 v1.1 fix), fully darkening the
+// panel — merely setting brightness to 0 leaves it at a ~2.5 V floor and
+// faintly lit. bsp_display_brightness_set(>0) re-enables the rail, so restoring
+// our normal 80% brightness also brings the backlight back. LVGL task.
+void PatioUI::set_backlight_rail_(bool on) {
+  if (on)
+    bsp_display_brightness_set(80);
+  else
+    bsp_display_backlight_off();
+}
+
 // Swipe-up gesture -> jump straight back to the clock (first) tile. LVGL task only.
 void PatioUI::go_home_tile() {
   if (this->tv_ == nullptr || this->tiles_[TILE_TIME] == nullptr)
@@ -720,6 +921,7 @@ void PatioUI::tick_() {
   // Clock tile refresh + idle auto-revert (both LVGL-task safe).
   this->refresh_time_tile_();
   this->maybe_auto_revert_();
+  this->maybe_screen_sleep_();
 }
 
 // Redraw the timer tile for the current state (LVGL task).
