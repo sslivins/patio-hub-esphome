@@ -14,6 +14,10 @@
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 
+#ifdef PATIO_AEC
+#include "patio_aec_ref.h"
+#endif
+
 namespace esphome::patio_ui {
 
 static const size_t TASK_STACK_SIZE = 4096;
@@ -234,6 +238,13 @@ void PatioSpeaker::spk_task(void *params) {
 
       played_any = true;
       last_data_ms = millis();
+
+#ifdef PATIO_AEC
+      // Feed the just-played PCM to the AEC far-end reference so the mic can
+      // cancel this audio out of its capture (enables wake-word barge-in while
+      // the TTS reply is playing).
+      aec_ref_push((const int16_t *) buffer.data(), bytes_read / sizeof(int16_t));
+#endif
 
       uint32_t frames = this_speaker->audio_stream_info_.bytes_to_frames(bytes_read);
       this_speaker->audio_output_callback_.call(frames, esp_timer_get_time());

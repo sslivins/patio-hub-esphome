@@ -2482,7 +2482,32 @@ void PatioUI::setup() {
   // wait_for_flushing (the flush DMAs straight from the PSRAM px_map). This is
   // fixed for free on the CoreS3 (ESP32-S3, SOC_PSRAM_DMA_CAPABLE == 1), where
   // buff_dma+buff_spiram is supported — defer the tear-free path to that board.
+#ifdef PATIO_DISPLAY_PSRAM
+  // CoreS3 (ESP32-S3, SOC_PSRAM_DMA_CAPABLE == 1): allocate the LVGL draw
+  // buffers in PSRAM instead of scarce internal DMA SRAM. The default
+  // bsp_display_start() hardcodes buff_dma=true / buff_spiram=false, pinning the
+  // ~51 KB (40-row double) draw buffer in internal RAM — which leaves no room
+  // for esp-sr's AEC (~31 KB internal floor it cannot take from PSRAM, causing
+  // the "LVGL buffer (buf2) allocation" boot-loop). The S3's SPI DMA can read
+  // the flush buffer straight from PSRAM, so moving it there frees the internal
+  // RAM the AEC needs. buff_dma stays TRUE alongside buff_spiram: the S3's PSRAM
+  // is DMA-capable, so the port must allocate with MALLOC_CAP_DMA|MALLOC_CAP_SPIRAM
+  // for the SPI panel to DMA the flush straight from PSRAM. (With buff_dma=false
+  // the buffer is not DMA-registered and the flush wedges — the screen freezes.)
+  bsp_display_cfg_t disp_cfg = {
+      .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+      .buffer_size = BSP_LCD_H_RES * CONFIG_BSP_LCD_DRAW_BUF_HEIGHT,
+      .double_buffer = true,
+      .flags = {
+          .buff_dma = true,
+          .buff_spiram = true,
+          .sw_rotate = false,
+      },
+  };
+  lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
+#else
   lv_display_t *disp = bsp_display_start();
+#endif
   if (disp == nullptr) {
     ESP_LOGE(TAG, "bsp_display_start failed");
     this->mark_failed();

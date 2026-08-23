@@ -54,6 +54,19 @@ class PatioMicrophone final : public microphone::Microphone, public Component {
 
   esp_codec_dev_handle_t codec_{nullptr};
   float gain_db_{30.0f};
+
+#ifdef PATIO_AEC
+  // esp-sr acoustic echo canceller. Created once in setup(); processes each
+  // captured frame against the speaker's far-end reference (see patio_aec_ref)
+  // so the wake word can trigger while a TTS reply is playing (barge-in).
+  // Stored as void* / raw int16 buffers so esp_aec.h stays out of this header.
+  void init_aec_();
+  void *aec_handle_{nullptr};      // aec_handle_t*
+  size_t aec_frame_samples_{0};    // samples per aec_process() call (0 = disabled)
+  int16_t *aec_mic_{nullptr};      // aligned scratch: mic in
+  int16_t *aec_ref_{nullptr};      // aligned scratch: far-end reference
+  int16_t *aec_out_{nullptr};      // aligned scratch: cleaned out
+#endif
 };
 
 }  // namespace esphome::patio_ui

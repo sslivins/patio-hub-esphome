@@ -11,6 +11,12 @@
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 
+#ifdef PATIO_AEC
+#include <cstring>
+#include "esp_aec.h"
+#include "patio_aec_ref.h"
+#endif
+
 namespace esphome::patio_ui {
 
 // Multiple consumers (micro_wake_word + voice_assistant) can each hold a
@@ -67,7 +73,49 @@ void PatioMicrophone::setup() {
   }
 
   this->configure_stream_settings_();
+
+#ifdef PATIO_AEC
+  this->init_aec_();
+#endif
 }
+
+#ifdef PATIO_AEC
+void PatioMicrophone::init_aec_() {
+  aec_config_t cfg = {};
+  cfg.mic_num = 1;
+  cfg.ref_num = 1;
+  cfg.out_num = 1;
+  cfg.filter_length = 4;  // Espressif-recommended for ESP32-S3
+  cfg.sample_rate = SAMPLE_RATE;
+  // Push the AEC's own working buffers to PSRAM (internal RAM is scarce here);
+  // only our small per-frame scratch buffers stay internal.
+  cfg.caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+  cfg.mode = AEC_MODE_FD_LOW_COST;   // full-duplex: linear filter + nonlinear post-filter
+  cfg.nlp_level = AEC_NLP_LEVEL_AGGR;
+
+  aec_handle_t *handle = aec_create_from_config(&cfg);
+  if (handle == nullptr) {
+    ESP_LOGE(TAG, "AEC create failed; running half-duplex (no barge-in)");
+    return;
+  }
+
+  this->aec_frame_samples_ = (size_t) aec_get_chunksize(handle);
+  const size_t bytes = this->aec_frame_samples_ * sizeof(int16_t);
+  // esp_aec requires 16-bit signed buffers allocated with an aligned allocator.
+  this->aec_mic_ = (int16_t *) heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  this->aec_ref_ = (int16_t *) heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  this->aec_out_ = (int16_t *) heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (this->aec_mic_ == nullptr || this->aec_ref_ == nullptr || this->aec_out_ == nullptr) {
+    ESP_LOGE(TAG, "AEC scratch alloc failed; running half-duplex");
+    aec_destroy(handle);
+    this->aec_frame_samples_ = 0;
+    return;
+  }
+
+  this->aec_handle_ = (void *) handle;
+  ESP_LOGCONFIG(TAG, "AEC ready: FD_LOW_COST, frame=%u samples", (unsigned) this->aec_frame_samples_);
+}
+#endif
 
 void PatioMicrophone::dump_config() {
   ESP_LOGCONFIG(TAG,
@@ -145,7 +193,14 @@ void PatioMicrophone::mic_task(void *params) {
   xEventGroupSetBits(this_microphone->event_group_, MicrophoneEventGroupBits::TASK_STARTING);
 
   {  // Ensures the samples vector is freed when the task stops
-    const size_t bytes_to_read = this_microphone->audio_stream_info_.ms_to_bytes(READ_DURATION_MS);
+    size_t bytes_to_read = this_microphone->audio_stream_info_.ms_to_bytes(READ_DURATION_MS);
+#ifdef PATIO_AEC
+    // When AEC is active, read exactly one AEC frame per iteration so each read
+    // maps 1:1 to an aec_process() call and stays sample-locked with the ref.
+    const bool use_aec = (this_microphone->aec_handle_ != nullptr) && (this_microphone->aec_frame_samples_ > 0);
+    if (use_aec)
+      bytes_to_read = this_microphone->aec_frame_samples_ * sizeof(int16_t);
+#endif
     std::vector<uint8_t> samples;
     samples.reserve(bytes_to_read);
 
@@ -155,6 +210,19 @@ void PatioMicrophone::mic_task(void *params) {
       if (this_microphone->data_callbacks_.size() > 0) {
         samples.resize(bytes_to_read);
         size_t bytes_read = this_microphone->read_(samples.data(), bytes_to_read);
+#ifdef PATIO_AEC
+        // Cancel the speaker's echo out of the captured frame using the far-end
+        // reference the speaker task pushed. Requires a full frame; short reads
+        // fall through as raw audio.
+        if (use_aec && bytes_read == bytes_to_read) {
+          const size_t n = this_microphone->aec_frame_samples_;
+          std::memcpy(this_microphone->aec_mic_, samples.data(), bytes_read);
+          aec_ref_pull(this_microphone->aec_ref_, n);
+          aec_process((aec_handle_t *) this_microphone->aec_handle_, this_microphone->aec_mic_,
+                      this_microphone->aec_ref_, this_microphone->aec_out_);
+          std::memcpy(samples.data(), this_microphone->aec_out_, bytes_read);
+        }
+#endif
         samples.resize(bytes_read);
         this_microphone->data_callbacks_.call(samples);
       } else {

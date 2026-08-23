@@ -312,6 +312,31 @@ async def to_code(config):
         # ADC on the shared duplex I2S bus). Enable the audio path in the C++
         # component (Core2's audio hardware differs, so this is cores3-only).
         cg.add_define("PATIO_AUDIO")
+        # --- Acoustic echo cancellation (AEC) for wake-word barge-in: SHELVED ---
+        # The idea: pull Espressif's esp-sr and enable its standalone AEC
+        # (esp_aec) so the mic can cancel the AW88298's TTS playback out of its
+        # own capture, letting "Okay Nabu" trigger while a reply is playing and
+        # removing the ~5 s half-duplex dead window. The full implementation is
+        # kept in-tree, gated on the PATIO_AEC / PATIO_DISPLAY_PSRAM defines
+        # (components/patio_ui/patio_aec_ref.* + patio_microphone.cpp + the
+        # bsp_display_start_with_config path in patio_ui.cpp).
+        #
+        # DISABLED (2026-08-23) after a hardware trial. esp_aec FD_LOW_COST needs
+        # ~31 KB of INTERNAL RAM it cannot take from PSRAM, which collides with
+        # LVGL's internal DMA draw buffer (boot-loop: "Not enough memory for LVGL
+        # buffer (buf2) allocation!"). Moving the LVGL draw buffer to PSRAM
+        # (PATIO_DISPLAY_PSRAM) freed the internal RAM and let AEC init, but the
+        # PSRAM-backed flush destabilised the device: display-sleep crash + the
+        # heavier flushes competing with AEC's per-frame processing starved the
+        # micro_wake_word input ring (constant "Not enough free bytes... Resetting"
+        # -> unreliable wake word). On this CoreS3, full-quality AEC and a stable
+        # LVGL display contend for the same scarce internal RAM / core / SPI bus,
+        # so we reverted to the stable half-duplex build. A future attempt could
+        # try a lighter AEC (AEC_MODE_SR_LOW_COST, filter_length 2) and/or a
+        # smaller draw buffer to keep the display in internal RAM.
+        # cg.add_define("PATIO_AEC")
+        # esp32.add_idf_component(name="espressif/esp-sr", ref="2.5.1")
+        # cg.add_define("PATIO_DISPLAY_PSRAM")
         # The BSP default draw buffer is 100 rows double-buffered (~128 KB) in
         # internal DMA SRAM. With PSRAM + the IRAM/-O2 flags below there is no
         # longer a contiguous 64 KB block free, so bsp_display_start() OOMs on
