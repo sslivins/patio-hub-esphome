@@ -21,6 +21,7 @@ typedef struct _lv_anim_t lv_anim_t;
 
 #include "esphome/components/api/custom_api_device.h"
 #include "esphome/components/time/real_time_clock.h"
+#include "esphome/core/automation.h"
 #include "esphome/core/preferences.h"
 
 namespace esphome {
@@ -46,13 +47,20 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   float get_setup_priority() const override { return setup_priority::LATE; }
   void dump_config() override;
 
-  // Swipeable tile order (a clock/temperature tile leads, then the controls).
-  static constexpr int TILE_TIME = 0;
-  static constexpr int TILE_HEATER = 1;
-  static constexpr int TILE_LIGHTS = 2;
-  static constexpr int TILE_SCREENS = 3;
-  static constexpr int TILE_MEDIA = 4;
-  static constexpr int NUM_TILES = 5;
+  // Tile kinds. The active tile set + order is configured in YAML via `tiles:`
+  // (default = the patio set); only the requested tiles are built. These values
+  // must match TILE_KINDS in __init__.py.
+  enum TileKind : uint8_t {
+    TK_TIME = 0,
+    TK_HEATER = 1,
+    TK_CLIMATE = 2,
+    TK_LIGHTS = 3,
+    TK_SCREENS = 4,
+    TK_MEDIA = 5,
+  };
+  static constexpr int MAX_TILES = 6;
+  // YAML codegen: append a tile kind to the ordered tile set.
+  void add_tile(int kind);
   // Revert to the clock tile (or the heater tile if a timer is running) after
   // this much untouched time.
   static constexpr uint32_t IDLE_REVERT_MS = 60000;
@@ -61,10 +69,22 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // burn-in from the static clock. The next touch is swallowed (just wakes).
   static constexpr uint32_t SCREEN_SLEEP_MS = 180000;  // 3 min of inactivity -> eyelids close
 
+  // On battery ONLY: once the screen has been asleep (backlight cut) for this
+  // much additional idle time, hand off to the ESP deep_sleep component to save
+  // the battery. A screen TAP (FT6336 INT on the RTC-capable GPIO39) reboots and
+  // wakes it back into the UI. Never triggers on USB power (the device just
+  // stays screen-asleep). Total idle before deep sleep = SCREEN_SLEEP_MS + this.
+  static constexpr uint32_t DEEP_SLEEP_AFTER_SCREEN_MS = 120000;  // +2 min after screen sleep
+
   // The deliberate eyes-opening sweep on wake uses this duration; the
   // "fighting sleep" nod-off close durations are baked into the keyframe table
   // in patio_ui.cpp.
   static constexpr uint32_t SCREEN_OPEN_MS = 520;  // deliberate eyes-open on wake
+
+  // Fired when the device decides to enter deep sleep (on battery + screen
+  // idle). The board entrypoint wires this to the ESPHome `deep_sleep`
+  // component (GPIO39 tap-wake) via `on_deep_sleep_request`.
+  Trigger<> *get_deep_sleep_trigger() { return &this->deep_sleep_trigger_; }
 
   // YAML-configurable Home Assistant contract.
   void set_run_script(const std::string &s) { this->run_script_ = s; }
@@ -92,6 +112,10 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   static constexpr int NUM_SCREENS = 4;   // left, right, rear_left, rear_right
   // YAML codegen: bind a screen slot to a cover entity + display label.
   void add_screen(int slot, const std::string &entity, const std::string &label);
+  // Tile title (default "Screens") + layout: 0 = perimeter map (patio deck),
+  // 1 = horizontal row (side slots single-width, rear/center slots double-width).
+  void set_screen_title(const std::string &s) { this->screen_title_ = s; }
+  void set_screen_layout(int mode) { this->screen_layout_ = mode; }
 
   // Screen intents (called from the LVGL task; touch LVGL + selection only).
   void toggle_screen_sel(int idx);
@@ -131,6 +155,34 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   }
   void set_media_label(const std::string &s) { this->media_label_ = s; }
 
+  // --- climate (thermostat) ---
+  // YAML codegen: bind the climate tile to a HA climate entity + display label
+  // and the setpoint range/step (defaults suit a single-zone mini-split).
+  void set_climate_entity(const std::string &s) {
+    this->climate_entity_ = s;
+    this->climate_configured_ = true;
+  }
+  void set_climate_label(const std::string &s) { this->climate_label_ = s; }
+  void set_climate_min(float v) { this->climate_min_ = v; }
+  void set_climate_max(float v) { this->climate_max_ = v; }
+  void set_climate_step(float v) { this->climate_step_ = v; }
+  // When true, the tile displays/steps in °C while HA speaks °F: incoming
+  // temps are converted F->C, and setpoints are converted C->F before sending.
+  void set_climate_celsius(bool v) { this->climate_celsius_ = v; }
+
+  // Runtime-adjustable idle timeouts, settable from HA (template number
+  // entities in the board yaml). Both are whole seconds of untouched time:
+  //   screen  = idle before the screen (backlight) turns off
+  //   sleep   = total idle before the device deep-sleeps (on battery only)
+  // Defaults preserve the compile-time patio behaviour when never called.
+  void set_screen_timeout_s(float s);
+  void set_sleep_timeout_s(float s);
+
+  // Climate intents (called from the LVGL task; only touch atomics).
+  void request_climate_setpoint(int delta_steps);  // +/- N steps, clamped + optimistic
+  void request_climate_mode_index(int idx);         // set mode from the mode dropdown (0..3)
+  void request_climate_fan_index(int idx);          // set fan from the fan dropdown (0..3)
+
   // Media intents (called from the LVGL task; only touch atomics).
   void request_media_cmd(int cmd);        // 1=play/pause, 2=next, 3=prev
   void request_media_volume(int pct);     // 0..100
@@ -142,6 +194,13 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // --- display / UI bring-up ---
   void build_ui_();
 
+#ifdef PATIO_AUDIO
+  // CoreS3 only: one-shot hardware proof that plays a tone through the AW88298
+  // speaker and logs captured RMS/peak from the ES7210 mics, both via the BSP
+  // codec init (which owns the shared I2C bus + AW9523 enable + amp gain).
+  void audio_selftest_();
+#endif
+
   // --- live screen capture (uncompressed PNG over HTTP on :8080) ---
   void start_screenshot_server_();
   void *screenshot_httpd_{nullptr};  // httpd_handle_t (opaque; kept void* to keep header light)
@@ -152,12 +211,20 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void on_timer_finishes_at_(std::string finishes_at);  // absolute UTC end time
   void on_light_state_(std::string entity_id, std::string state);       // "on"/"off"
   void on_light_bright_(std::string entity_id, std::string brightness);  // 0..255
+  void on_screen_position_(std::string entity_id, std::string position); // cover current_position 0..100
   void on_outside_temp_(std::string state);                              // clock-tile temperature
   void on_temp_unit_(std::string unit);                                  // temp sensor's unit (°C/°F)
   void on_media_state_(std::string state);                               // playing/paused/idle
   void on_media_volume_(std::string volume);                             // 0.0..1.0
   void on_media_title_(std::string title);                               // now-playing text
+  // Climate (thermostat) state subscriptions.
+  void on_climate_state_(std::string state);            // hvac mode: off/heat/cool/dry/fan_only/auto
+  void on_climate_action_(std::string action);          // hvac_action: heating/cooling/idle/off
+  void on_climate_cur_temp_(std::string v);             // current_temperature
+  void on_climate_target_temp_(std::string v);          // temperature (setpoint)
+  void on_climate_fan_(std::string v);                  // fan_mode
   int light_index_for_entity_(const std::string &entity_id) const;
+  int screen_index_for_entity_(const std::string &entity_id) const;
 
   // --- LVGL-task helpers ---
   static void tick_cb_(lv_timer_t *t);
@@ -176,6 +243,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   static int batt_mv_to_pct_(int mv);  // rough LiPo SoC from resting mV
   void maybe_auto_revert_();                 // LVGL task only — idle -> clock/heater tile
   void maybe_screen_sleep_();                // LVGL task only — idle -> fade to black
+  void maybe_deep_sleep_();                  // main task only — on battery + idle -> deep sleep
   void set_backlight_rail_(bool on);         // AXP2101 BLDO1 rail cut/restore (LVGL task)
   void set_cpu_freq_(int min_mhz, int max_mhz);  // DFS floor/ceiling via esp_pm (80-240 asleep / 240 awake)
   static void fade_step_cb_(void *var, int32_t v);  // lv_anim: set both eyelid heights
@@ -192,6 +260,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void refresh_lights_ui_();                 // LVGL task only
   void build_media_tile_(lv_obj_t *tile);    // LVGL task only
   void refresh_media_ui_();                  // LVGL task only
+  void build_heater_tile_(lv_obj_t *tile);   // LVGL task only — iOS-timer style picker/countdown
+  void build_climate_tile_(lv_obj_t *tile);  // LVGL task only — thermostat controls
+  void refresh_climate_ui_();                // LVGL task only — setpoint/current/mode/fan + bg
 
   // --- config ---
   std::string run_script_{"script.patio_heater_run"};
@@ -203,6 +274,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   uint32_t last_rtc_write_ms_{0};     // throttles RTC write-back from HA time
   void *axp_dev_{nullptr};            // i2c_master_dev_handle_t for the AXP2101 (0x34)
   uint32_t last_status_poll_ms_{0};   // throttles battery/power/network polling
+  bool deep_sleep_pending_{false};    // main task: latched once we ask to deep sleep
+  Trigger<> deep_sleep_trigger_;      // fired to hand off to the deep_sleep component
   int min_minutes_{5};
   int max_minutes_{480};
 
@@ -217,10 +290,19 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   bool flash_on_{false};               // current flash phase (LVGL task only)
   bool flashing_{false};               // true while the flasher owns the tile
 
-  // tileview + bottom page-position dots (LVGL task only)
+  // tileview + bottom page-position dots (LVGL task only). The active tile set
+  // + order is configured via YAML `tiles:`; only `num_tiles_` of these slots
+  // are used, in the order given by `tile_order_`.
   lv_obj_t *tv_{nullptr};
-  lv_obj_t *tiles_[NUM_TILES]{};
-  lv_obj_t *page_dots_[NUM_TILES]{};
+  lv_obj_t *tiles_[MAX_TILES]{};
+  lv_obj_t *page_dots_[MAX_TILES]{};
+  uint8_t tile_order_[MAX_TILES]{};   // kind at each position (codegen order)
+  int num_tiles_{0};
+  // Named pointers for tiles other code jumps to (null when that tile isn't in
+  // the configured set).
+  lv_obj_t *time_tile_{nullptr};
+  lv_obj_t *heater_tile_{nullptr};
+  lv_obj_t *climate_tile_{nullptr};
 
   // Screen-sleep (burn-in guard): a full-screen transparent presser on the top
   // layer, revealed when the backlight is off so the first tap only wakes, plus
@@ -229,6 +311,17 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   lv_obj_t *eyelid_top_{nullptr};
   lv_obj_t *eyelid_bottom_{nullptr};
   bool screen_asleep_{false};  // LVGL task only
+  // millis() when the screen finished sleeping (backlight cut), 0 = awake.
+  // Written on the LVGL task (finish_sleep_/wake_screen), read on the main task
+  // (maybe_deep_sleep_) — hence atomic.
+  std::atomic<uint32_t> screen_asleep_at_ms_{0};
+  // Runtime idle timeouts (ms), adjustable from HA. Defaults match the historic
+  // compile-time constants so the patio hub (which never sets them) is unchanged.
+  // screen_sleep_ms_ = idle before the backlight cuts; deep_sleep_total_ms_ =
+  // total idle before deep sleep (the "additional after screen off" delay is
+  // computed as deep_sleep_total_ms_ - screen_sleep_ms_, floored at 0).
+  std::atomic<uint32_t> screen_sleep_ms_{SCREEN_SLEEP_MS};
+  std::atomic<uint32_t> deep_sleep_total_ms_{SCREEN_SLEEP_MS + DEEP_SLEEP_AFTER_SCREEN_MS};
   int sleep_kf_idx_{0};        // current "fighting sleep" close keyframe (LVGL task only)
 
   // clock/temperature tile widgets (LVGL task only)
@@ -241,6 +334,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
 
   // screen tile widgets (LVGL task only)
   lv_obj_t *screen_btn_[NUM_SCREENS]{};
+  lv_obj_t *screen_fill_[NUM_SCREENS]{};  // position-fill overlay (how far the blind is down)
   lv_obj_t *ctrl_up_{nullptr};
   lv_obj_t *ctrl_stop_{nullptr};
   lv_obj_t *ctrl_down_{nullptr};
@@ -262,6 +356,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   bool screen_configured_[NUM_SCREENS]{};
   ScreenTap screen_tap_[NUM_SCREENS];
   bool screen_sel_[NUM_SCREENS]{};  // LVGL task only
+  std::string screen_title_{"Screens"};
+  int screen_layout_{0};  // 0=perimeter map, 1=horizontal row
 
   // --- light config ---
   std::string light_entity_[NUM_LIGHTS];
@@ -273,6 +369,32 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::string media_entity_;
   std::string media_label_{"Music"};
   bool media_configured_{false};
+
+  // --- climate (thermostat) config ---
+  std::string climate_entity_;
+  std::string climate_label_{"Climate"};
+  bool climate_configured_{false};
+  float climate_min_{61.0f};
+  float climate_max_{88.0f};
+  float climate_step_{1.0f};
+  bool climate_celsius_{false};
+  // climate widgets (LVGL task only)
+  lv_obj_t *climate_cur_lbl_{nullptr};    // "Now 76°"
+  lv_obj_t *climate_set_lbl_{nullptr};    // big setpoint "68°"
+  lv_obj_t *climate_mode_dd_{nullptr};    // mode selector dropdown (Off/Cool/Heat/Auto)
+  lv_obj_t *climate_fan_dd_{nullptr};     // fan selector dropdown (Auto/Low/Med/High)
+  // climate cross-task state (main task writes from HA, LVGL task reads). Temps
+  // are stored *10 to keep half-degree steps in integer atomics; -10000 == unknown.
+  std::atomic<int> climate_mode_{0};       // index into the full mode table (see cpp)
+  std::atomic<int> climate_action_{0};     // 0 off/idle,1 heating,2 cooling,3 drying,4 fan
+  std::atomic<int> climate_cur_x10_{-10000};    // current temperature *10
+  std::atomic<int> climate_target_x10_{-10000}; // setpoint *10
+  std::atomic<int> climate_fan_{0};        // index into the fan table (see cpp)
+  std::atomic<bool> climate_ui_dirty_{true};
+  // pending intents (LVGL task -> main task); sentinels mean "nothing pending".
+  std::atomic<int> pending_climate_target_x10_{-10000};  // absolute setpoint *10 to send
+  std::atomic<int> pending_climate_mode_{-1};            // mode index to send
+  std::atomic<int> pending_climate_fan_{-1};             // fan index to send
 
   // --- cross-task state (atomics) ---
   std::atomic<int> setpoint_minutes_{30};     // desired run length
@@ -297,6 +419,10 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // screens: UI -> HA pending cover action (Somfy RTS = command-only, no state)
   std::atomic<int> pending_cover_action_{0};     // 0 none,1 open/up,2 close/down,3 stop
   std::atomic<unsigned> pending_cover_mask_{0};  // bitmask of selected screens
+  // Per-cover position feedback (Lutron etc.). 0=closed/down, 100=open/up,
+  // -1=unknown (e.g. Somfy RTS, which never reports position -> never disables).
+  std::atomic<int> screen_pos_[NUM_SCREENS];
+  std::atomic<bool> screen_ui_dirty_{false};     // HA position changed -> refresh visuals
 
   // lights: bidirectional (lights report state, unlike Somfy).
   //   HA -> UI: last known on/off + brightness, refreshed on the LVGL task.

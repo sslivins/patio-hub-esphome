@@ -1,0 +1,59 @@
+# ============================================================================
+# LVGL fling-performance test  —  M5Stack CoreS3  (ISOLATED harness)
+#
+# A deliberately minimal ESPHome config that reuses the exact same CoreS3 BSP +
+# esp_lvgl_port + LVGL stack as patio-hub-cores3.yaml, but runs ONLY a bare
+# tileview + a self-driving scroll animation + a frame-timing log. No Home
+# Assistant bridge, no CPU-freq scaling, no screen-sleep, no AXP tweaks, no
+# fonts/widgets beyond a label per tile.
+#
+# Purpose: determine whether the choppy tile fling is caused by patio_ui or by
+# the BSP/LVGL/display baseline. If the fling is smooth here -> the problem is
+# in patio_ui; if it is still choppy -> it is the baseline stack.
+#
+# FIRST FLASH MUST BE WIRED USB (COM4). After that, OTA to 192.168.1.210 works.
+# This uses a distinct name (lvgl-perf-test) so it does not collide with the
+# real patio-hub-s3 on mDNS. Re-flash patio-hub-cores3.yaml to restore the hub.
+# ============================================================================
+substitutions:
+  name: lvgl-perf-test
+
+esphome:
+  name: ${name}
+
+esp32:
+  board: m5stack-cores3
+  framework:
+    type: esp-idf
+
+# CoreS3 = ESP32-S3 with 8 MB QUAD PSRAM (NOT octal — octal fails to init with
+# 'PSRAM chip is not connected, or wrong PSRAM line mode'). Matches the hub.
+psram:
+  mode: quad
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [perf_ui]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Perf Test Fallback"
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret core2_patio_api_key
+
+ota:
+  - platform: esphome
+    password: !secret core2_patio_ota_password
+
+# The isolated LVGL fling harness (pulls the CoreS3 BSP + LVGL config itself).
+perf_ui:

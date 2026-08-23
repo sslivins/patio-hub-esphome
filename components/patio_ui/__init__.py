@@ -1,5 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
+from esphome import automation
 from esphome.components import esp32, time as time_
 from esphome.const import CONF_ID, CONF_TIME_ID
 
@@ -17,8 +18,36 @@ CONF_MAX_MINUTES = "max_minutes"
 CONF_SCREENS = "screens"
 CONF_LIGHTS = "lights"
 CONF_MEDIA = "media"
+CONF_CLIMATE = "climate"
 CONF_ENTITY_ID = "entity_id"
 CONF_LABEL = "label"
+
+CONF_TILES = "tiles"
+CONF_MIN_TEMP = "min_temp"
+CONF_MAX_TEMP = "max_temp"
+CONF_TEMP_STEP = "temp_step"
+
+CONF_TITLE = "title"
+CONF_LAYOUT = "layout"
+CONF_UNIT = "unit"
+
+# Swipeable tile kinds. The YAML `tiles:` list selects which tiles are built and
+# in what order; these ints MUST match the TileKind enum in patio_ui.h.
+TILE_KINDS = {
+    "time": 0,
+    "heater": 1,
+    "climate": 2,
+    "lights": 3,
+    "screens": 4,
+    "media": 5,
+}
+# Default tile set = the original patio layout, so existing configs that omit
+# `tiles:` behave exactly as before.
+DEFAULT_TILES = ["time", "heater", "lights", "screens", "media"]
+
+# Automation fired when the component decides to enter deep sleep (on battery +
+# screen idle). The board entrypoint wires this to the `deep_sleep` component.
+CONF_ON_DEEP_SLEEP_REQUEST = "on_deep_sleep_request"
 
 # Fixed on-screen slots for the deck-perimeter map, as seen by someone standing
 # in front of the Core2 (on the north wall). "rear_*" are the two side-by-side
@@ -76,9 +105,15 @@ BSP_VARIANTS = {
     "cores3": {
         "component": "m5stack_core_s3",
         "path": "bsp/m5stack_core_s3",
-        # Same fork commit for now (it mirrors the whole esp-bsp tree). If the
-        # CoreS3 folder needs its own fix, point repo/ref at a dedicated branch.
         "repo": ESP_BSP_REPO,
+        # Stock BSP. A previous fork (perf/cores3-60mhz-spi) tried to raise the
+        # LCD SPI pixel clock 40->60MHz, but on-device verification proved the
+        # ESP32-S3 GPSPI divider only resolves to 40MHz (requests 41-60) or
+        # 80MHz (requests 61-80) from its fixed 80MHz APB source -- a 60MHz
+        # request runs at a real 40MHz, so the fork was a no-op. 80MHz produces
+        # visible tearing/artifacts on this panel, so 40MHz stock is the right
+        # value. Real fling smoothness comes from the sdkconfig perf flags below
+        # (LV_DEF_REFR_PERIOD, -O2/IRAM, 40-row internal draw buffer), not SPI.
         "ref": ESP_BSP_REF,
         "axp2101": True,   # CoreS3 also uses an AXP2101 (+ an AW9523 expander)
     },
@@ -95,6 +130,20 @@ SCREEN_SCHEMA = cv.Schema(
     }
 )
 
+# The full screens block: one entry per fixed slot, plus an optional tile title
+# and layout. `perimeter` (default) is the patio deck map; `row` lays the covers
+# out left-to-right with the rear/centre slots double-width (bedroom blinds).
+SCREENS_SCHEMA = cv.Schema(
+    {cv.Optional(slot): SCREEN_SCHEMA for slot in SCREEN_SLOTS}
+).extend(
+    {
+        cv.Optional(CONF_TITLE, default="Screens"): cv.string,
+        cv.Optional(CONF_LAYOUT, default="perimeter"): cv.one_of(
+            "perimeter", "row", lower=True
+        ),
+    }
+)
+
 LIGHT_SCHEMA = cv.Schema(
     {
         cv.Required(CONF_ENTITY_ID): cv.string,
@@ -107,6 +156,24 @@ MEDIA_SCHEMA = cv.Schema(
     {
         cv.Required(CONF_ENTITY_ID): cv.string,
         cv.Optional(CONF_LABEL, default="Music"): cv.string,
+    }
+)
+
+# Single HA climate entity (thermostat/mini-split): setpoint + mode + fan. The
+# setpoint range/step default to a comfortable whole-degree bedroom range.
+CLIMATE_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_ENTITY_ID): cv.string,
+        cv.Optional(CONF_LABEL, default="Climate"): cv.string,
+        cv.Optional(CONF_MIN_TEMP, default=61.0): cv.float_,
+        cv.Optional(CONF_MAX_TEMP, default=88.0): cv.float_,
+        cv.Optional(CONF_TEMP_STEP, default=1.0): cv.positive_float,
+        # Display/step unit. HA speaks whatever its system unit is (°F here);
+        # "celsius" makes the tile show/step in °C and convert to/from °F.
+        # When "celsius", express min/max/step below in °C.
+        cv.Optional(CONF_UNIT, default="fahrenheit"): cv.one_of(
+            "fahrenheit", "celsius", lower=True
+        ),
     }
 )
 
@@ -126,13 +193,18 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_DEFAULT_MINUTES, default=30): cv.int_range(min=1, max=1440),
         cv.Optional(CONF_MIN_MINUTES, default=5): cv.int_range(min=1, max=1440),
         cv.Optional(CONF_MAX_MINUTES, default=480): cv.int_range(min=1, max=1440),
-        cv.Optional(CONF_SCREENS): cv.Schema(
-            {cv.Optional(slot): SCREEN_SCHEMA for slot in SCREEN_SLOTS}
-        ),
+        cv.Optional(CONF_SCREENS): SCREENS_SCHEMA,
         cv.Optional(CONF_LIGHTS): cv.Schema(
             {cv.Optional(slot): LIGHT_SCHEMA for slot in LIGHT_SLOTS}
         ),
         cv.Optional(CONF_MEDIA): MEDIA_SCHEMA,
+        cv.Optional(CONF_CLIMATE): CLIMATE_SCHEMA,
+        cv.Optional(CONF_TILES, default=DEFAULT_TILES): cv.ensure_list(
+            cv.one_of(*TILE_KINDS, lower=True)
+        ),
+        cv.Optional(CONF_ON_DEEP_SLEEP_REQUEST): automation.validate_automation(
+            single=True
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -153,6 +225,8 @@ async def to_code(config):
 
     # Perimeter screen controls (each slot -> fixed on-screen position).
     screens = config.get(CONF_SCREENS, {})
+    cg.add(var.set_screen_title(screens.get(CONF_TITLE, "Screens")))
+    cg.add(var.set_screen_layout(1 if screens.get(CONF_LAYOUT) == "row" else 0))
     for idx, slot in enumerate(SCREEN_SLOTS):
         if slot in screens:
             sc = screens[slot]
@@ -172,6 +246,29 @@ async def to_code(config):
         media = config[CONF_MEDIA]
         cg.add(var.set_media_entity(media[CONF_ENTITY_ID]))
         cg.add(var.set_media_label(media[CONF_LABEL]))
+
+    # Thermostat/climate (single HA climate entity: setpoint + mode + fan).
+    if CONF_CLIMATE in config:
+        clim = config[CONF_CLIMATE]
+        cg.add(var.set_climate_entity(clim[CONF_ENTITY_ID]))
+        cg.add(var.set_climate_label(clim[CONF_LABEL]))
+        cg.add(var.set_climate_min(clim[CONF_MIN_TEMP]))
+        cg.add(var.set_climate_max(clim[CONF_MAX_TEMP]))
+        cg.add(var.set_climate_step(clim[CONF_TEMP_STEP]))
+        cg.add(var.set_climate_celsius(clim[CONF_UNIT] == "celsius"))
+
+    # Ordered tile set. add_tile() appends each kind in the configured order;
+    # build_ui_ then builds only these tiles.
+    for kind in config[CONF_TILES]:
+        cg.add(var.add_tile(TILE_KINDS[kind]))
+
+    # Deep-sleep hand-off: the component owns the policy (on battery + screen
+    # idle) and fires this trigger; the board entrypoint attaches the mechanism
+    # (deep_sleep.enter with GPIO39 tap-wake).
+    if CONF_ON_DEEP_SLEEP_REQUEST in config:
+        await automation.build_automation(
+            var.get_deep_sleep_trigger(), [], config[CONF_ON_DEEP_SLEEP_REQUEST]
+        )
 
     # Pull the selected M5Stack board's BSP (esp_lcd + esp_lvgl_port DMA flush
     # + touch). The C++ only uses the generic <bsp/esp-bsp.h> API, so the board
@@ -194,9 +291,42 @@ async def to_code(config):
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_TILEVIEW", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_ARC", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_ROLLER", True)
+    esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_DROPDOWN", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_SNAPSHOT", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_20", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_28", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_FONT_MONTSERRAT_48", True)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_MEM_SIZE_KILOBYTES", 64)
     esp32.add_idf_sdkconfig_option("CONFIG_LV_USE_PERF_MONITOR", True)
+
+    # LVGL / LCD render performance (per Espressif's esp_lvgl_port performance
+    # guide). Tile fling/scroll animations are render-CPU-bound on the Xtensa S3
+    # (no LVGL blend assembly exists for Xtensa — only ARM NEON/Helium and the
+    # RISC-V path that makes the ESP32-P4 Tab5 smooth). These flags are the
+    # canonical, benchmark-backed fixes and roughly doubled FPS in Espressif's
+    # tests. Our frame buffer (100-row double buffer in internal DMA SRAM) is
+    # already in the recommended >25%-of-screen zone, so the wins here come from
+    # CPU/flash/refresh tuning rather than buffer size.
+    if config[CONF_VARIANT] == "cores3":
+        # CoreS3 has real audio hardware (AW88298 speaker amp + ES7210 dual-mic
+        # ADC on the shared duplex I2S bus). Enable the audio path in the C++
+        # component (Core2's audio hardware differs, so this is cores3-only).
+        cg.add_define("PATIO_AUDIO")
+        # The BSP default draw buffer is 100 rows double-buffered (~128 KB) in
+        # internal DMA SRAM. With PSRAM + the IRAM/-O2 flags below there is no
+        # longer a contiguous 64 KB block free, so bsp_display_start() OOMs on
+        # buf1 and asserts. 40 rows double-buffered (~51 KB) fits comfortably and
+        # was validated on hardware to sustain ~27 fps flings.
+        esp32.add_idf_sdkconfig_option("CONFIG_BSP_LCD_DRAW_BUF_HEIGHT", 40)
+        # Refresh every 10 ms instead of the 30 ms default — the single biggest
+        # subjective scroll-smoothness win (LVGL only repaints once per period,
+        # so 30 ms caps fling animations at ~33 fps and updates coarsely).
+        esp32.add_idf_sdkconfig_option("CONFIG_LV_DEF_REFR_PERIOD", 10)
+        # Put the hot LVGL draw/blend functions in IRAM so they don't run from
+        # (slower) cached flash.
+        esp32.add_idf_sdkconfig_option("CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM", True)
+        # Build the render path with -O2 (speed) rather than the -Os default.
+        # OPTIMIZATION_* is a Kconfig choice, so the default SIZE must be
+        # explicitly disabled for PERF to take effect.
+        esp32.add_idf_sdkconfig_option("CONFIG_COMPILER_OPTIMIZATION_SIZE", False)
+        esp32.add_idf_sdkconfig_option("CONFIG_COMPILER_OPTIMIZATION_PERF", True)

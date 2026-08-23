@@ -20,6 +20,10 @@ external_components:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Mains-powered always-on hub: keep the radio fully awake so it never drops off
+  # the LAN (multi-AP mesh + modem-sleep otherwise makes it miss ARP/beacons and
+  # go "unavailable" in HA when idle). Deep sleep on battery is unaffected.
+  power_save_mode: none
   ap:
     ssid: "Patio Hub Fallback"
 

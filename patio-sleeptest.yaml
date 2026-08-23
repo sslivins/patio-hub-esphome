@@ -1,0 +1,158 @@
+# ============================================================================
+# Patio Hub  —  DEEP-SLEEP BATTERY PROBE  (temporary test firmware)
+#
+# Throwaway config to measure Core2 v1.1 deep-sleep battery life WITH touch
+# wake. This is NOT the real firmware — flash it over SERIAL (COM15), let it
+# run overnight on battery, read the battery discharge curve in Home Assistant,
+# then flash the real patio-hub.yaml back.
+#
+# Each cycle:
+#   * boot -> bring up the AXP2101 I2C, enable the battery ADC, CUT the
+#     backlight rail (BLDO1 / reg 0x90 bit4 — the true rail-off, identical to
+#     esp-bsp brightness=0), and silence the side CHGLED.
+#   * connect WiFi + native API, publish battery mV + fuel-gauge % + on-battery
+#     to HA, wait a few seconds for the recorder to capture it, then deep sleep.
+#   * sleeps for ${sleep_dur}; ALSO wakes early on a screen TAP — the FT6336
+#     touch INT is on GPIO39 (RTC-capable, ext0). Only the backlight rail is
+#     cut, so the touch controller stays powered and a tap wakes it exactly
+#     like the real device will.
+#
+# It reuses the real device's name + secrets so it drops straight into the
+# existing HA integration and records the battery sensors immediately. The
+# normal UI entities go unavailable for the duration and come back when you
+# reflash patio-hub.yaml.
+#
+# Quick sanity check before the overnight run: set sleep_dur to e.g. 2min,
+# flash, confirm (a) it appears in HA, publishes a voltage, then drops offline
+# ~10 s later, and (b) tapping the dark screen brings it back online within a
+# few seconds. Then bump sleep_dur back to 30min for the real measurement.
+# ============================================================================
+substitutions:
+  name: patio-hub
+  friendly_name: Patio Hub
+  sleep_dur: 168h
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    upload_speed: 460800
+  includes:
+    - axp_probe.h
+  on_boot:
+    # Cut the backlight rail + silence the LED as early as possible (before
+    # WiFi), so the brief awake window is measured with the screen already
+    # dark. Idempotent across wake cycles.
+    - priority: 600
+      then:
+        - lambda: |-
+            axp_probe::enable_batt_adc();
+            axp_probe::panel_and_touch_off();
+            axp_probe::silence_led();
+    # SAFETY / ANTI-BRICK: if we're on USB power (VBUS present) OR the "Keep
+    # Awake" switch is on, cancel the run_duration auto-sleep so the device
+    # stays awake and OTA-able. Deep sleep then only ever engages on battery.
+    # Plugging in USB is therefore a guaranteed, instant recovery path.
+    - priority: -100
+      then:
+        - if:
+            condition:
+              or:
+                - lambda: 'return !axp_probe::on_battery();'
+                - switch.is_on: keep_awake
+            then:
+              - deep_sleep.prevent: ds
+
+esp32:
+  board: m5stack-core2
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret core2_patio_api_key
+  on_client_connected:
+    # HA connected -> fresh reading, push it, let it land in the recorder, then
+    # drop back into deep sleep. Keeps the awake window to ~10 s.
+    - delay: 2s
+    - lambda: |-
+        id(batt_mv).publish_state(axp_probe::batt_mv());
+        id(batt_gauge).publish_state(axp_probe::read_reg(0xA4));
+        int p = axp_probe::batt_pct();
+        if (p >= 0) id(batt_pct).publish_state(p);
+        id(on_batt).publish_state(axp_probe::on_battery());
+    - delay: 4s
+    # Only drop back into deep sleep when actually on battery AND not held awake.
+    # On USB power (or with Keep Awake on) we stay up so OTA works.
+    - if:
+        condition:
+          and:
+            - lambda: 'return axp_probe::on_battery();'
+            - switch.is_off: keep_awake
+        then:
+          - deep_sleep.enter: ds
+
+ota:
+  - platform: esphome
+    password: !secret core2_patio_ota_password
+
+deep_sleep:
+  id: ds
+  # DEEPEST-SLEEP test: no touch-wake armed and an effectively infinite timer
+  # (168h) so the device sleeps until the physical RESET button reboots it.
+  # The panel + touch rails are cut in on_boot, so nothing but a reset brings
+  # it back — this isolates the true deep-sleep floor with zero wake bursts.
+  sleep_duration: ${sleep_dur}
+  # Hard cap: if WiFi/HA never connects this cycle, still sleep after 60 s so a
+  # bad cycle can't sit awake draining the battery and skewing the test.
+  run_duration: 60s
+
+sensor:
+  - platform: template
+    name: "Batt Voltage"
+    id: batt_mv
+    unit_of_measurement: "mV"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    name: "Batt Percent"
+    id: batt_pct
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    name: "Batt Gauge Raw"
+    id: batt_gauge
+    accuracy_decimals: 0
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    name: "On Battery"
+    id: on_batt
+
+switch:
+  # Bench convenience / manual override: while ON (and reachable), the device
+  # will not deep sleep. Toggle it on while the device is awake (on USB or
+  # during a wake window) to hold it awake for OTA / inspection. Restored from
+  # flash across deep-sleep cycles.
+  - platform: template
+    name: "Keep Awake"
+    id: keep_awake
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - deep_sleep.prevent: ds
+    turn_off_action:
+      - deep_sleep.allow: ds

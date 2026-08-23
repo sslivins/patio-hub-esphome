@@ -1,0 +1,179 @@
+# ============================================================================
+# Natalie's Room  —  M5Stack Core2 v1.1  (HYBRID native-LVGL build)
+#
+# Standalone entrypoint (NOT the patio package). Reuses the same `patio_ui`
+# external component, but configures a bedroom control set:
+#   * clock/temperature tile
+#   * thermostat/climate tile  (the AC / heat-pump)
+#   * lights tile              (main + closet)
+#   * blinds via the screens tile (Lutron shades)
+#
+# As with the patio hub, the component owns the WHOLE display stack (esp_lcd +
+# esp_lvgl_port via the M5Stack BSP); we do NOT declare display/lvgl/i2c/
+# touchscreen/axp2101 here.
+#
+# NOTE: enable "Allow the device to perform Home Assistant actions" on this
+# device's ESPHome integration in HA, or the controls won't call services.
+# ============================================================================
+substitutions:
+  name: natalie-room
+  friendly_name: Natalie's Room
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    upload_speed: 460800
+  # Push the restored idle-timeout settings into the UI component once at boot
+  # (belt-and-suspenders alongside each number's set_action).
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(natalie_ui).set_screen_timeout_s(id(screen_timeout_s).state);
+          id(natalie_ui).set_sleep_timeout_s(id(sleep_timeout_s).state);
+
+esp32:
+  board: m5stack-core2
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Power-management framework so patio_ui can drop the CPU to 80 MHz while
+      # the screen is asleep (DFS only; no light sleep).
+      CONFIG_PM_ENABLE: y
+
+psram:
+  mode: quad
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [patio_ui]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Natalie Room Fallback"
+
+captive_portal:
+
+logger:
+  level: DEBUG
+
+api:
+  # Reuse the existing Core2 API key/OTA password so no new secrets are needed.
+  encryption:
+    key: !secret core2_patio_api_key
+  homeassistant_states: true
+  homeassistant_services: true
+
+ota:
+  - platform: esphome
+    password: !secret core2_patio_ota_password
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# On-battery deep sleep with FT6336 tap-wake (same as the patio hub): GPIO39 is
+# the touch INT (RTC-capable), so a tap wakes the device from deep sleep. No
+# sleep_duration/run_duration -> only sleeps when patio_ui asks (on battery +
+# screen idle), never on USB, never on a timer.
+deep_sleep:
+  id: deep_sleep_ctl
+  wakeup_pin:
+    number: GPIO39
+    inverted: true            # touch INT is active-low
+  wakeup_pin_mode: INVERT_WAKEUP
+
+patio_ui:
+  id: natalie_ui
+  variant: core2
+  time_id: ha_time
+  # Clock-tile outside temperature (reuse the Mercer Island stand-in outdoor
+  # sensor for now).
+  temp_sensor: sensor.outdoor_kitchen_sensor_temperature
+
+  # Bedroom tile set + order (no heater/media). The climate tile is new.
+  tiles: [time, climate, lights, screens]
+
+  # AC / heat-pump. Whole-degree steps are friendlier for a kid's room. The
+  # unit's range is 61..88 °F; shown in °C (16..31) — the tile converts to/from
+  # °F, which is what HA reports for this entity.
+  climate:
+    entity_id: climate.heatlink_3e30_heat_pump
+    label: "AC"
+    unit: celsius
+    min_temp: 16
+    max_temp: 31
+    temp_step: 1
+
+  # Two dimmable light groups (main ceiling + closet) shown as vertical faders.
+  lights:
+    main:
+      entity_id: light.natalies_bedroom_main_lights
+      label: "Main"
+    bbq:
+      entity_id: light.natalies_bedroom_closet_light
+      label: "Closet"
+
+  # Three Lutron shades laid out as a left-to-right row, with the centre blind
+  # rendered double-width (narrow | wide | narrow). left/right map to the side
+  # slots; the centre blind uses the rear_left slot (double-width in row mode).
+  screens:
+    title: "Blinds"
+    layout: row
+    left:
+      entity_id: cover.natalies_bedroom_left
+      label: "Left"
+    rear_left:
+      entity_id: cover.natalies_bedroom_center
+      label: "Center"
+    right:
+      entity_id: cover.natalies_bedroom_right
+      label: "Right"
+
+  # Wire the UI's deep-sleep policy trigger to the board's deep_sleep mechanism.
+  on_deep_sleep_request:
+    - deep_sleep.enter: deep_sleep_ctl
+
+# HA-adjustable idle timeouts (appear as configuration Number entities on this
+# device in Home Assistant). "Screen Timeout" = idle seconds before the screen
+# turns off; "Sleep Timeout" = total idle seconds before the device deep-sleeps
+# (deep sleep only ever happens on battery — on USB it just stays screen-off).
+# Values persist across reboots (restore_value) and are pushed into patio_ui via
+# each set_action plus the on_boot lambda above.
+number:
+  - platform: template
+    name: "Screen Timeout"
+    id: screen_timeout_s
+    icon: "mdi:monitor-off"
+    entity_category: config
+    unit_of_measurement: s
+    min_value: 10
+    max_value: 600
+    step: 5
+    initial_value: 30
+    restore_value: true
+    optimistic: true
+    mode: box
+    set_action:
+      - lambda: "id(natalie_ui).set_screen_timeout_s(x);"
+  - platform: template
+    name: "Sleep Timeout"
+    id: sleep_timeout_s
+    icon: "mdi:power-sleep"
+    entity_category: config
+    unit_of_measurement: s
+    min_value: 30
+    max_value: 3600
+    step: 30
+    initial_value: 120
+    restore_value: true
+    optimistic: true
+    mode: box
+    set_action:
+      - lambda: "id(natalie_ui).set_sleep_timeout_s(x);"

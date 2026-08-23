@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "esp_app_desc.h"
 #include "esp_pm.h"
+#include "esp_private/esp_clk.h"
 #include "png_uncompressed.h"
 
 #include "esphome/core/application.h"
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cmath>
 #include <sys/time.h>
 
 namespace esphome {
@@ -84,6 +86,38 @@ static lv_color_t heater_bg_for_remaining(int rem_secs) {
 #define COL_SCREEN_TILE lv_color_hex(0x14424F)
 #define COL_SEL lv_color_hex(0xFFD54A)
 
+// --- climate (thermostat) tile ---
+// Tile background per hvac mode: neutral slate (off), cool blue, warm orange,
+// teal (auto). Picked in refresh_climate_ui_ from the current mode.
+#define COL_CLIMATE_OFF lv_color_hex(0x37414F)
+#define COL_CLIMATE_COOL lv_color_hex(0x1C567E)
+#define COL_CLIMATE_HEAT lv_color_hex(0x9A4A16)
+#define COL_CLIMATE_AUTO lv_color_hex(0x1E6E5A)
+
+// Full hvac mode table. Index is stored in climate_mode_ atomic; HA names map to
+// these indices in on_climate_state_.
+enum {
+  CLM_OFF = 0,
+  CLM_HEAT = 1,
+  CLM_COOL = 2,
+  CLM_DRY = 3,
+  CLM_FAN = 4,
+  CLM_AUTO = 5,
+  CLM_COUNT = 6,
+};
+static const char *const CLIMATE_MODE_HA[CLM_COUNT] = {"off", "heat", "cool", "dry", "fan_only", "auto"};
+static const char *const CLIMATE_MODE_LBL[CLM_COUNT] = {"Off", "Heat", "Cool", "Dry", "Fan", "Auto"};
+// The mode button cycles through this subset (the everyday modes for a bedroom
+// mini-split); other modes still display correctly if HA reports them.
+static const int CLIMATE_MODE_CYCLE[] = {CLM_OFF, CLM_COOL, CLM_HEAT, CLM_AUTO};
+static const int CLIMATE_MODE_CYCLE_N = sizeof(CLIMATE_MODE_CYCLE) / sizeof(CLIMATE_MODE_CYCLE[0]);
+
+// Fan table (auto/low/medium/high). HA fan names that aren't in this list are
+// mapped to the nearest entry in on_climate_fan_.
+static const char *const CLIMATE_FAN_HA[] = {"auto", "low", "medium", "high"};
+static const char *const CLIMATE_FAN_LBL[] = {"Auto", "Low", "Med", "High"};
+static const int CLIMATE_FAN_N = 4;
+
 // event-callback trampolines (run on the LVGL task)
 static void ev_heater_roller(lv_event_t *e) {  // scroll picker -> set minutes
   static_cast<PatioUI *>(lv_event_get_user_data(e))->on_heater_roller_changed();
@@ -116,6 +150,31 @@ static void ev_gesture(lv_event_t *e) {  // swipe up anywhere -> jump to the clo
     return;
   if (lv_indev_get_gesture_dir(indev) == LV_DIR_TOP)
     static_cast<PatioUI *>(lv_event_get_user_data(e))->go_home_tile();
+}
+// lv_indev_scroll_throw_predict lives in src/indev/lv_indev_scroll.h, which
+// lvgl.h does not pull in; forward-declare the public symbol.
+extern "C" int32_t lv_indev_scroll_throw_predict(lv_indev_t *indev, lv_dir_t dir);
+static void ev_scroll_begin(lv_event_t *e) {  // retune the snap animation to the fling velocity
+  // LVGL hands us the scroll snap animation (created but not yet started) as the
+  // event param. By default its duration is a fixed, distance-based 200-400 ms,
+  // so every swipe snaps at the same speed regardless of how hard you flick.
+  // Rewrite the duration from the fling velocity: hard flick -> quick snap,
+  // gentle swipe -> slow ease. One tile per swipe is unchanged (tileview snap).
+  lv_anim_t *a = static_cast<lv_anim_t *>(lv_event_get_param(e));
+  if (a == nullptr)
+    return;  // non-animated scroll
+  lv_indev_t *indev = lv_indev_active();
+  if (indev == nullptr)
+    return;  // programmatic tile change (no finger) -> keep LVGL's default timing
+  // Predicted throw distance is proportional to release velocity; take the
+  // magnitude on whichever axis is scrolling as the "how hard did you flick" signal.
+  int32_t pv = lv_indev_scroll_throw_predict(indev, LV_DIR_VER);
+  int32_t ph = lv_indev_scroll_throw_predict(indev, LV_DIR_HOR);
+  int32_t mag = LV_MAX(LV_ABS(pv), LV_ABS(ph));
+  constexpr int32_t kFastMs = 120, kSlowMs = 400, kMagMax = 140;
+  int32_t mag_c = mag > kMagMax ? kMagMax : mag;
+  int32_t t = kSlowMs - (kSlowMs - kFastMs) * mag_c / kMagMax;
+  lv_anim_set_duration(a, static_cast<uint32_t>(t));
 }
 static void ev_wake(lv_event_t *e) {  // tap while asleep -> wake, swallow the tap
   static_cast<PatioUI *>(lv_event_get_user_data(e))->wake_screen();
@@ -151,6 +210,20 @@ static void ev_media_vol_live(lv_event_t *e) {  // fader dragging -> update the 
   auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
   int v = lv_slider_get_value(static_cast<lv_obj_t *>(lv_event_get_target(e)));
   self->update_media_vol_label_(v);
+}
+static void ev_climate_up(lv_event_t *e) {  // thermostat "+" -> raise setpoint one step
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->request_climate_setpoint(+1);
+}
+static void ev_climate_down(lv_event_t *e) {  // thermostat "-" -> lower setpoint one step
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->request_climate_setpoint(-1);
+}
+static void ev_climate_mode(lv_event_t *e) {  // mode dropdown -> set hvac mode
+  lv_obj_t *dd = static_cast<lv_obj_t *>(lv_event_get_target(e));
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->request_climate_mode_index(lv_dropdown_get_selected(dd));
+}
+static void ev_climate_fan(lv_event_t *e) {  // fan dropdown -> set fan mode
+  lv_obj_t *dd = static_cast<lv_obj_t *>(lv_event_get_target(e));
+  static_cast<PatioUI *>(lv_event_get_user_data(e))->request_climate_fan_index(lv_dropdown_get_selected(dd));
 }
 
 static lv_obj_t *make_tile_title(lv_obj_t *parent, const char *txt) {
@@ -237,95 +310,59 @@ void PatioUI::build_ui_() {
   lv_obj_t *scr = lv_screen_active();
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
+  // Tile scroll axis. Vertical was trialed (it hides the horizontal-shear
+  // tearing better) but horizontal is the preferred feel for this hub. The
+  // velocity-scaled snap (ev_scroll_begin) works in either orientation.
+  static constexpr bool kVerticalTiles = false;
+
   lv_obj_t *tv = lv_tileview_create(scr);
   lv_obj_set_style_bg_opa(tv, LV_OPA_TRANSP, 0);
   lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);  // replaced by page dots below
   this->tv_ = tv;
 
-  lv_obj_t *t_time = lv_tileview_add_tile(tv, 0, 0, LV_DIR_HOR);
-  lv_obj_t *t_heater = lv_tileview_add_tile(tv, 1, 0, LV_DIR_HOR);
-  lv_obj_t *t_lights = lv_tileview_add_tile(tv, 2, 0, LV_DIR_HOR);
-  lv_obj_t *t_screens = lv_tileview_add_tile(tv, 3, 0, LV_DIR_HOR);
-  lv_obj_t *t_media = lv_tileview_add_tile(tv, 4, 0, LV_DIR_HOR);
-  this->tiles_[TILE_TIME] = t_time;
-  this->tiles_[TILE_HEATER] = t_heater;
-  this->tiles_[TILE_LIGHTS] = t_lights;
-  this->tiles_[TILE_SCREENS] = t_screens;
-  this->tiles_[TILE_MEDIA] = t_media;
-
-  // Bubble touch gestures up to the tileview/screen so a swipe on any tile body
-  // reaches ev_gesture (attached to the screen below).
-  for (int i = 0; i < NUM_TILES; i++)
-    lv_obj_add_flag(this->tiles_[i], LV_OBJ_FLAG_EVENT_BUBBLE);
-  lv_obj_add_flag(tv, LV_OBJ_FLAG_EVENT_BUBBLE);
-
-  // --- clock + outside-temperature tile (the resting/idle screen) ---
-  this->build_time_tile_(t_time);
-
-  // --- heater tile (live, wired to HA): iOS-timer style picker ---
-  //   idle    : scroll the roller to pick 15/30/45/60 min; Start begins the run
-  //   running : big MM:SS countdown; Cancel stops, "+15 min" extends the run
-  lv_obj_set_style_bg_color(t_heater, COL_HEATER, 0);
-  lv_obj_set_style_bg_opa(t_heater, LV_OPA_COVER, 0);
-  make_tile_title(t_heater, "Heater");
-
-  // Vertical scroll picker (idle only). Options map 0..3 -> 15/30/45/60 min.
-  lv_obj_t *roller = lv_roller_create(t_heater);
-  lv_roller_set_options(roller, "15 min\n30 min\n45 min\n60 min", LV_ROLLER_MODE_NORMAL);
-  lv_roller_set_visible_row_count(roller, 3);
-  lv_obj_set_width(roller, 180);
-  lv_obj_align(roller, LV_ALIGN_TOP_MID, 0, 40);
-  lv_obj_set_style_bg_opa(roller, LV_OPA_TRANSP, LV_PART_MAIN);
-  lv_obj_set_style_border_width(roller, 0, LV_PART_MAIN);
-  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_MAIN);
-  lv_obj_set_style_text_opa(roller, LV_OPA_40, LV_PART_MAIN);      // dim the unselected rows
-  lv_obj_set_style_text_font(roller, &lv_font_montserrat_28, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(roller, lv_color_white(), LV_PART_SELECTED);
-  lv_obj_set_style_bg_opa(roller, LV_OPA_10, LV_PART_SELECTED);    // subtle centre band
-  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_SELECTED);
-  lv_obj_set_style_text_opa(roller, LV_OPA_COVER, LV_PART_SELECTED);
-  lv_obj_set_style_text_font(roller, &lv_font_montserrat_28, LV_PART_SELECTED);
-  {
-    int sel = this->setpoint_minutes_.load() / 15 - 1;
-    if (sel < 0) sel = 0;
-    if (sel > 3) sel = 3;
-    lv_roller_set_selected(roller, sel, LV_ANIM_OFF);
+  // Build only the configured tiles, in the configured order. add_tile() (called
+  // from codegen) populated tile_order_/num_tiles_; if the YAML omitted `tiles:`
+  // fall back to the historical patio set so the device is never blank.
+  if (this->num_tiles_ == 0) {
+    static const uint8_t kDefault[] = {TK_TIME, TK_HEATER, TK_LIGHTS, TK_SCREENS, TK_MEDIA};
+    for (uint8_t k : kDefault)
+      this->tile_order_[this->num_tiles_++] = k;
   }
-  lv_obj_add_event_cb(roller, ev_heater_roller, LV_EVENT_VALUE_CHANGED, this);
-  this->heater_roller_ = roller;
 
-  // Big MM:SS countdown (running only). Same slot as the roller. Uses the
-  // largest built-in font (montserrat 48); a transform-based zoom was tried but
-  // it deadlocks lv_snapshot (the /screenshot endpoint), so it's avoided.
-  this->heater_value_ = lv_label_create(t_heater);
-  lv_obj_set_style_text_color(this->heater_value_, lv_color_white(), 0);
-  lv_obj_set_style_text_font(this->heater_value_, &patio_font_countdown, 0);
-  lv_label_set_text(this->heater_value_, "--");
-  lv_obj_align(this->heater_value_, LV_ALIGN_TOP_MID, 0, 60);
-
-  // Bottom action row: End Now (left, running only) + Start / "+15 min" (right).
-  this->heater_btn_left_ = make_btn(t_heater, "End Now", ev_heater_cancel, this);
-  lv_obj_set_size(this->heater_btn_left_, 132, 48);
-  lv_obj_align(this->heater_btn_left_, LV_ALIGN_BOTTOM_LEFT, 14, -22);
-  lv_obj_set_style_bg_color(this->heater_btn_left_, lv_color_hex(0x000000), 0);
-  lv_obj_set_style_bg_opa(this->heater_btn_left_, LV_OPA_30, 0);
-
-  this->heater_btn_right_ = make_btn(t_heater, "Start", ev_heater_action, this);
-  lv_obj_set_size(this->heater_btn_right_, 132, 48);
-  lv_obj_align(this->heater_btn_right_, LV_ALIGN_BOTTOM_RIGHT, -14, -22);
-  lv_obj_set_style_bg_color(this->heater_btn_right_, lv_color_hex(0xFFB870), 0);
-  lv_obj_set_style_bg_opa(this->heater_btn_right_, LV_OPA_COVER, 0);
-  this->heater_btn_right_lbl_ = lv_obj_get_child(this->heater_btn_right_, 0);
-  lv_obj_set_style_text_color(this->heater_btn_right_lbl_, lv_color_black(), 0);
-
-  // --- lights tile (live, wired to HA dimmable lights) ---
-  this->build_lights_tile_(t_lights);
-
-  // --- screens tile (live perimeter map, wired to HA covers) ---
-  this->build_screens_tile_(t_screens);
-
-  // --- deck media tile (live, wired to a HA media_player) ---
-  this->build_media_tile_(t_media);
+  for (int col = 0; col < this->num_tiles_; col++) {
+    lv_obj_t *tile = kVerticalTiles ? lv_tileview_add_tile(tv, 0, col, LV_DIR_VER)
+                                    : lv_tileview_add_tile(tv, col, 0, LV_DIR_HOR);
+    this->tiles_[col] = tile;
+    // Bubble touch gestures up to the tileview/screen so a swipe on any tile
+    // body reaches ev_gesture (attached to the screen below).
+    lv_obj_add_flag(tile, LV_OBJ_FLAG_EVENT_BUBBLE);
+    switch (this->tile_order_[col]) {
+      case TK_TIME:
+        this->time_tile_ = tile;
+        this->build_time_tile_(tile);
+        break;
+      case TK_HEATER:
+        this->heater_tile_ = tile;
+        this->build_heater_tile_(tile);
+        break;
+      case TK_CLIMATE:
+        this->climate_tile_ = tile;
+        this->build_climate_tile_(tile);
+        break;
+      case TK_LIGHTS:
+        this->build_lights_tile_(tile);
+        break;
+      case TK_SCREENS:
+        this->build_screens_tile_(tile);
+        break;
+      case TK_MEDIA:
+        this->build_media_tile_(tile);
+        break;
+      default:
+        break;
+    }
+  }
+  lv_obj_add_flag(tv, LV_OBJ_FLAG_EVENT_BUBBLE);
 
   // Bottom page-position dots (replaces the tileview scroll line). Live on the
   // screen so they float over every tile; updated when the active tile changes.
@@ -337,7 +374,7 @@ void PatioUI::build_ui_() {
   lv_obj_set_flex_align(dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(dots, 9, 0);
   lv_obj_clear_flag(dots, LV_OBJ_FLAG_CLICKABLE);
-  for (int i = 0; i < NUM_TILES; i++) {
+  for (int i = 0; i < this->num_tiles_; i++) {
     lv_obj_t *d = lv_obj_create(dots);
     lv_obj_remove_style_all(d);
     lv_obj_set_size(d, 8, 8);
@@ -349,7 +386,9 @@ void PatioUI::build_ui_() {
   }
   lv_obj_add_event_cb(tv, ev_tile_scroll, LV_EVENT_VALUE_CHANGED, this);
   lv_obj_add_event_cb(tv, ev_tile_scroll, LV_EVENT_SCROLL_END, this);
-  lv_obj_add_event_cb(scr, ev_gesture, LV_EVENT_GESTURE, this);
+  lv_obj_add_event_cb(tv, ev_scroll_begin, LV_EVENT_SCROLL_BEGIN, this);  // velocity-scaled snap speed
+  if (!kVerticalTiles)  // swipe-up==scroll in vertical mode; don't hijack it for go-home
+    lv_obj_add_event_cb(scr, ev_gesture, LV_EVENT_GESTURE, this);
   this->update_page_dots_();
 
   // Full-screen presser on the top layer. Hidden while awake (so it blocks
@@ -391,12 +430,77 @@ void PatioUI::update_page_dots_() {
   if (this->tv_ == nullptr)
     return;
   lv_obj_t *active = lv_tileview_get_tile_active(this->tv_);
-  for (int i = 0; i < NUM_TILES; i++) {
+  for (int i = 0; i < this->num_tiles_; i++) {
     if (this->page_dots_[i] == nullptr)
       continue;
     bool on = (this->tiles_[i] == active);
     lv_obj_set_style_bg_opa(this->page_dots_[i], on ? LV_OPA_COVER : LV_OPA_40, 0);
   }
+}
+
+// YAML codegen entry point: append a tile kind to the ordered set (bounded).
+void PatioUI::add_tile(int kind) {
+  if (this->num_tiles_ >= MAX_TILES)
+    return;
+  this->tile_order_[this->num_tiles_++] = static_cast<uint8_t>(kind);
+}
+
+// --- heater tile (live, wired to HA): iOS-timer style picker ---
+//   idle    : scroll the roller to pick 15/30/45/60 min; Start begins the run
+//   running : big MM:SS countdown; Cancel stops, "+15 min" extends the run
+void PatioUI::build_heater_tile_(lv_obj_t *tile) {
+  lv_obj_set_style_bg_color(tile, COL_HEATER, 0);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+  make_tile_title(tile, "Heater");
+
+  // Vertical scroll picker (idle only). Options map 0..3 -> 15/30/45/60 min.
+  lv_obj_t *roller = lv_roller_create(tile);
+  lv_roller_set_options(roller, "15 min\n30 min\n45 min\n60 min", LV_ROLLER_MODE_NORMAL);
+  lv_roller_set_visible_row_count(roller, 3);
+  lv_obj_set_width(roller, 180);
+  lv_obj_align(roller, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_set_style_bg_opa(roller, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(roller, 0, LV_PART_MAIN);
+  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_MAIN);
+  lv_obj_set_style_text_opa(roller, LV_OPA_40, LV_PART_MAIN);      // dim the unselected rows
+  lv_obj_set_style_text_font(roller, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(roller, lv_color_white(), LV_PART_SELECTED);
+  lv_obj_set_style_bg_opa(roller, LV_OPA_10, LV_PART_SELECTED);    // subtle centre band
+  lv_obj_set_style_text_color(roller, lv_color_white(), LV_PART_SELECTED);
+  lv_obj_set_style_text_opa(roller, LV_OPA_COVER, LV_PART_SELECTED);
+  lv_obj_set_style_text_font(roller, &lv_font_montserrat_28, LV_PART_SELECTED);
+  {
+    int sel = this->setpoint_minutes_.load() / 15 - 1;
+    if (sel < 0) sel = 0;
+    if (sel > 3) sel = 3;
+    lv_roller_set_selected(roller, sel, LV_ANIM_OFF);
+  }
+  lv_obj_add_event_cb(roller, ev_heater_roller, LV_EVENT_VALUE_CHANGED, this);
+  this->heater_roller_ = roller;
+
+  // Big MM:SS countdown (running only). Same slot as the roller. Uses the
+  // largest built-in font (montserrat 48); a transform-based zoom was tried but
+  // it deadlocks lv_snapshot (the /screenshot endpoint), so it's avoided.
+  this->heater_value_ = lv_label_create(tile);
+  lv_obj_set_style_text_color(this->heater_value_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->heater_value_, &patio_font_countdown, 0);
+  lv_label_set_text(this->heater_value_, "--");
+  lv_obj_align(this->heater_value_, LV_ALIGN_TOP_MID, 0, 60);
+
+  // Bottom action row: End Now (left, running only) + Start / "+15 min" (right).
+  this->heater_btn_left_ = make_btn(tile, "End Now", ev_heater_cancel, this);
+  lv_obj_set_size(this->heater_btn_left_, 132, 48);
+  lv_obj_align(this->heater_btn_left_, LV_ALIGN_BOTTOM_LEFT, 14, -22);
+  lv_obj_set_style_bg_color(this->heater_btn_left_, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(this->heater_btn_left_, LV_OPA_30, 0);
+
+  this->heater_btn_right_ = make_btn(tile, "Start", ev_heater_action, this);
+  lv_obj_set_size(this->heater_btn_right_, 132, 48);
+  lv_obj_align(this->heater_btn_right_, LV_ALIGN_BOTTOM_RIGHT, -14, -22);
+  lv_obj_set_style_bg_color(this->heater_btn_right_, lv_color_hex(0xFFB870), 0);
+  lv_obj_set_style_bg_opa(this->heater_btn_right_, LV_OPA_COVER, 0);
+  this->heater_btn_right_lbl_ = lv_obj_get_child(this->heater_btn_right_, 0);
+  lv_obj_set_style_text_color(this->heater_btn_right_lbl_, lv_color_black(), 0);
 }
 
 // --- clock + outside-temperature tile (the resting screen) ---
@@ -595,6 +699,57 @@ int PatioUI::batt_mv_to_pct_(int mv) {
   return 0;
 }
 
+// Runtime idle-timeout setters (called from HA number set_action / on_boot on
+// the main task; only touch atomics). Values arrive in seconds; clamp to sane
+// bounds and store as ms. sleep must be >= screen or deep sleep would fire the
+// instant the screen cuts (we floor the delta at 0 in maybe_deep_sleep_).
+void PatioUI::set_screen_timeout_s(float s) {
+  if (!(s > 0))  // guard NaN / non-positive
+    return;
+  if (s < 5)
+    s = 5;
+  this->screen_sleep_ms_.store(static_cast<uint32_t>(s * 1000.0f + 0.5f));
+  ESP_LOGI(TAG, "screen timeout -> %.0f s", s);
+}
+
+void PatioUI::set_sleep_timeout_s(float s) {
+  if (!(s > 0))
+    return;
+  if (s < 5)
+    s = 5;
+  this->deep_sleep_total_ms_.store(static_cast<uint32_t>(s * 1000.0f + 0.5f));
+  ESP_LOGI(TAG, "sleep (deep-sleep) timeout -> %.0f s", s);
+}
+
+// Main task: on battery, once the screen has been asleep (backlight cut) for
+// DEEP_SLEEP_AFTER_SCREEN_MS of additional idle time, hand off to the ESPHome
+// deep_sleep component (armed by the board entrypoint with GPIO39 tap-wake).
+// Never fires on USB power — plugging in keeps the device awake/reachable. A
+// tap on the dark screen pulls the FT6336 INT (RTC-capable GPIO39) low and
+// reboots the device straight back into the UI. Called from loop() just after
+// the power poll so on_battery_ is fresh.
+void PatioUI::maybe_deep_sleep_() {
+  uint32_t at = this->screen_asleep_at_ms_.load();
+  if (at == 0) {
+    this->deep_sleep_pending_ = false;   // screen awake again -> re-arm for next time
+    return;
+  }
+  if (this->deep_sleep_pending_)
+    return;                              // already handed off; awaiting sleep
+  if (!this->on_battery_.load())
+    return;                              // on USB -> never deep sleep
+  // Additional idle after the screen slept = total idle target minus the screen
+  // timeout (floored at 0). Both are runtime-adjustable from HA.
+  uint32_t screen_ms = this->screen_sleep_ms_.load();
+  uint32_t total_ms = this->deep_sleep_total_ms_.load();
+  uint32_t additional = (total_ms > screen_ms) ? (total_ms - screen_ms) : 0;
+  if ((millis() - at) < additional)
+    return;                              // not idle long enough yet
+  this->deep_sleep_pending_ = true;
+  ESP_LOGI(TAG, "on battery + screen idle -> entering deep sleep (tap GPIO39 to wake)");
+  this->deep_sleep_trigger_.trigger();
+}
+
 // After IDLE_REVERT_MS with no touch, drift back to the clock tile — unless a
 // heater timer is running, in which case rest on the heater/countdown tile so
 // the remaining time stays visible. LVGL task only.
@@ -603,12 +758,17 @@ void PatioUI::maybe_auto_revert_() {
     return;
   if (lv_display_get_inactive_time(nullptr) < IDLE_REVERT_MS)
     return;
-  int target = this->active_.load() ? TILE_HEATER : TILE_TIME;
-  if (this->tiles_[target] == nullptr)
+  // Rest on the heater/countdown tile while a timer runs (so remaining time
+  // stays visible), otherwise the clock tile. Fall back gracefully when either
+  // tile isn't in the configured set.
+  lv_obj_t *target = (this->active_.load() && this->heater_tile_ != nullptr)
+                         ? this->heater_tile_
+                         : this->time_tile_;
+  if (target == nullptr)
     return;
-  if (lv_tileview_get_tile_active(this->tv_) == this->tiles_[target])
+  if (lv_tileview_get_tile_active(this->tv_) == target)
     return;
-  lv_tileview_set_tile(this->tv_, this->tiles_[target], LV_ANIM_ON);
+  lv_tileview_set_tile(this->tv_, target, LV_ANIM_ON);
   this->update_page_dots_();
 }
 
@@ -623,7 +783,7 @@ void PatioUI::maybe_screen_sleep_() {
     return;
   if (this->active_.load())
     return;
-  if (lv_display_get_inactive_time(nullptr) < SCREEN_SLEEP_MS)
+  if (lv_display_get_inactive_time(nullptr) < this->screen_sleep_ms_.load())
     return;
   this->screen_asleep_ = true;
   lv_obj_set_height(this->eyelid_top_, 0);
@@ -707,7 +867,18 @@ void PatioUI::sleep_kf_done_cb_(lv_anim_t *a) {
 // unaffected. LVGL task.
 void PatioUI::finish_sleep_() {
   this->set_backlight_rail_(false);
+#ifdef PATIO_AUDIO
+  // CoreS3 voice hub: USB-powered and must stay responsive to the always-on
+  // wake word + native-API keepalive. Dropping the CPU floor to 80 MHz starves
+  // the Noise-encryption handshake/keepalive, so HA marks the device
+  // "unresponsive" and the satellite goes unavailable the moment the screen
+  // sleeps. Keep the clock pinned at full speed even while the screen is off
+  // (we still cut the backlight for burn-in). Power-save is irrelevant on USB.
+  this->set_cpu_freq_(240, 240);
+#else
   this->set_cpu_freq_(80, 240);
+#endif
+  this->screen_asleep_at_ms_.store(millis());  // arm the on-battery deep-sleep timer
   ESP_LOGD(TAG, "screen asleep (backlight off)");
 }
 
@@ -724,6 +895,7 @@ void PatioUI::wake_screen() {
   if (!this->screen_asleep_)
     return;
   this->screen_asleep_ = false;                    // re-entrant taps now no-op
+  this->screen_asleep_at_ms_.store(0);             // disarm the deep-sleep timer
   lv_anim_delete(this, PatioUI::fade_step_cb_);    // stop the nod-off if still closing
   this->set_cpu_freq_(240, 240);                   // full speed before the redraw
   this->set_backlight_rail_(true);                 // rail on; eyelids still hide the panel
@@ -784,11 +956,12 @@ void PatioUI::set_backlight_rail_(bool on) {
 
 // Swipe-up gesture -> jump straight back to the clock (first) tile. LVGL task only.
 void PatioUI::go_home_tile() {
-  if (this->tv_ == nullptr || this->tiles_[TILE_TIME] == nullptr)
+  lv_obj_t *home = (this->time_tile_ != nullptr) ? this->time_tile_ : this->tiles_[0];
+  if (this->tv_ == nullptr || home == nullptr)
     return;
-  if (lv_tileview_get_tile_active(this->tv_) == this->tiles_[TILE_TIME])
+  if (lv_tileview_get_tile_active(this->tv_) == home)
     return;
-  lv_tileview_set_tile(this->tv_, this->tiles_[TILE_TIME], LV_ANIM_ON);
+  lv_tileview_set_tile(this->tv_, home, LV_ANIM_ON);
   this->update_page_dots_();
 }
 
@@ -867,7 +1040,7 @@ void PatioUI::tick_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user
 void PatioUI::flash_cb_(lv_timer_t *t) { static_cast<PatioUI *>(lv_timer_get_user_data(t))->flash_tick_(); }
 
 void PatioUI::flash_tick_() {
-  if (this->heater_value_ == nullptr || this->tiles_[TILE_HEATER] == nullptr)
+  if (this->heater_value_ == nullptr || this->heater_tile_ == nullptr)
     return;
   int s = this->countdown_secs_.load();
   bool in_window = this->active_.load() && s > 0 && s <= EXPIRY_FLASH_SECS;
@@ -875,7 +1048,7 @@ void PatioUI::flash_tick_() {
     this->flash_on_ = !this->flash_on_;
     lv_color_t bg = this->flash_on_ ? lv_color_white() : COL_FLASH;
     lv_color_t fg = this->flash_on_ ? COL_FLASH : lv_color_white();
-    lv_obj_set_style_bg_color(this->tiles_[TILE_HEATER], bg, 0);
+    lv_obj_set_style_bg_color(this->heater_tile_, bg, 0);
     lv_obj_set_style_text_color(this->heater_value_, fg, 0);
     this->flashing_ = true;
   } else if (this->flashing_) {
@@ -918,6 +1091,10 @@ void PatioUI::tick_() {
     this->refresh_lights_ui_();
   if (this->media_ui_dirty_.exchange(false))
     this->refresh_media_ui_();
+  if (this->climate_ui_dirty_.exchange(false))
+    this->refresh_climate_ui_();
+  if (this->screen_ui_dirty_.exchange(false))
+    this->update_screen_visual_();
   // Clock tile refresh + idle auto-revert (both LVGL-task safe).
   this->refresh_time_tile_();
   this->maybe_auto_revert_();
@@ -948,9 +1125,9 @@ void PatioUI::refresh_heater_ui_() {
   // Nearing-expiry indicator: fade the tile background brown->amber->red over
   // the final EXPIRY_FADE_SECS. Normal brown while idle or with time to spare.
   // While the final-seconds flasher owns the tile, leave the background alone.
-  if (this->tiles_[TILE_HEATER] != nullptr && !this->flashing_) {
+  if (this->heater_tile_ != nullptr && !this->flashing_) {
     lv_color_t bg = active ? heater_bg_for_remaining(this->countdown_secs_.load()) : COL_HEATER;
-    lv_obj_set_style_bg_color(this->tiles_[TILE_HEATER], bg, 0);
+    lv_obj_set_style_bg_color(this->heater_tile_, bg, 0);
   }
 
   // Toggle picker vs countdown.
@@ -998,7 +1175,7 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   lv_obj_set_style_pad_all(tile, 0, 0);
 
   lv_obj_t *hdr = lv_label_create(tile);
-  lv_label_set_text(hdr, "Screens");
+  lv_label_set_text(hdr, this->screen_title_.c_str());
   lv_obj_set_style_text_color(hdr, lv_color_white(), 0);
   lv_obj_set_style_text_font(hdr, &lv_font_montserrat_20, 0);
   lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 4);
@@ -1008,26 +1185,83 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
     this->screen_tap_[i].idx = i;
   }
 
-  // Left (slot 0) / Right (slot 1): thin, tall side tiles on the edges, with a
-  // vertical valance bar so they read as side-wall-mounted (different from rear).
-  this->screen_btn_[0] = make_screen_button(tile, &this->screen_tap_[0], SCR_LEFT);
-  lv_obj_set_size(this->screen_btn_[0], 52, 100);
-  lv_obj_align(this->screen_btn_[0], LV_ALIGN_TOP_LEFT, 8, 32);
+  if (this->screen_layout_ == 1) {
+    // Horizontal row layout (e.g. bedroom blinds): the configured covers sit in
+    // a single left-to-right row. Side slots (left/right) are single-width; the
+    // rear slots (used as the "centre" positions) are double-width, so a
+    // left/centre/right trio reads as narrow | wide | narrow. All use the rear
+    // (horizontal headrail) button style so they read as roller blinds.
+    static const int kRowOrder[NUM_SCREENS] = {0, 2, 3, 1};   // left, rear_left, rear_right, right
+    static const int kRowWeight[NUM_SCREENS] = {1, 1, 2, 2};  // by slot: sides x1, rears x2
 
-  this->screen_btn_[1] = make_screen_button(tile, &this->screen_tap_[1], SCR_RIGHT);
-  lv_obj_set_size(this->screen_btn_[1], 52, 100);
-  lv_obj_align(this->screen_btn_[1], LV_ALIGN_TOP_RIGHT, -8, 32);
+    lv_obj_t *row = lv_obj_create(tile);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 304, 124);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 10, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-  // Rear Left (slot 2) / Rear Right (slot 3): the two side-by-side screens on the
-  // far wall behind the viewer — a centered landscape pair (horizontal valance),
-  // vertically centered against the left/right side screens (their center ~y82).
-  this->screen_btn_[2] = make_screen_button(tile, &this->screen_tap_[2], SCR_REAR);
-  lv_obj_set_size(this->screen_btn_[2], 88, 52);
-  lv_obj_align(this->screen_btn_[2], LV_ALIGN_TOP_MID, -47, 56);
+    for (int k = 0; k < NUM_SCREENS; k++) {
+      int slot = kRowOrder[k];
+      if (!this->screen_configured_[slot])
+        continue;
+      lv_obj_t *b = make_screen_button(row, &this->screen_tap_[slot], SCR_REAR);
+      lv_obj_set_height(b, 116);
+      lv_obj_set_width(b, 0);                          // flex-basis 0 -> pure proportional
+      lv_obj_set_flex_grow(b, kRowWeight[slot]);       // sides:1, centre:2 -> 1:2:1
+      this->screen_btn_[slot] = b;
+    }
+  } else {
+    // Perimeter map (patio deck): side screens on the edges, rear pair centred.
+    // Left (slot 0) / Right (slot 1): thin, tall side tiles on the edges, with a
+    // vertical valance bar so they read as side-wall-mounted (different from rear).
+    this->screen_btn_[0] = make_screen_button(tile, &this->screen_tap_[0], SCR_LEFT);
+    lv_obj_set_size(this->screen_btn_[0], 52, 100);
+    lv_obj_align(this->screen_btn_[0], LV_ALIGN_TOP_LEFT, 8, 32);
 
-  this->screen_btn_[3] = make_screen_button(tile, &this->screen_tap_[3], SCR_REAR);
-  lv_obj_set_size(this->screen_btn_[3], 88, 52);
-  lv_obj_align(this->screen_btn_[3], LV_ALIGN_TOP_MID, 47, 56);
+    this->screen_btn_[1] = make_screen_button(tile, &this->screen_tap_[1], SCR_RIGHT);
+    lv_obj_set_size(this->screen_btn_[1], 52, 100);
+    lv_obj_align(this->screen_btn_[1], LV_ALIGN_TOP_RIGHT, -8, 32);
+
+    // Rear Left (slot 2) / Rear Right (slot 3): the two side-by-side screens on the
+    // far wall behind the viewer — a centered landscape pair (horizontal valance),
+    // vertically centered against the left/right side screens (their center ~y82).
+    this->screen_btn_[2] = make_screen_button(tile, &this->screen_tap_[2], SCR_REAR);
+    lv_obj_set_size(this->screen_btn_[2], 88, 52);
+    lv_obj_align(this->screen_btn_[2], LV_ALIGN_TOP_MID, -47, 56);
+
+    this->screen_btn_[3] = make_screen_button(tile, &this->screen_tap_[3], SCR_REAR);
+    lv_obj_set_size(this->screen_btn_[3], 88, 52);
+    lv_obj_align(this->screen_btn_[3], LV_ALIGN_TOP_MID, 47, 56);
+  }
+
+  // Position-fill overlay: a translucent "shade" drawn over each blind's window
+  // pane, growing downward from the top in proportion to how far the blind is
+  // lowered (100 - current_position). Hidden until HA reports a position, so
+  // feedback-less covers (Somfy RTS) simply never show it. The pane is the
+  // button's first child (see make_screen_button).
+  for (int i = 0; i < NUM_SCREENS; i++) {
+    if (!this->screen_configured_[i] || this->screen_btn_[i] == nullptr)
+      continue;
+    lv_obj_t *pane = lv_obj_get_child(this->screen_btn_[i], 0);
+    if (pane == nullptr)
+      continue;
+    lv_obj_t *fill = lv_obj_create(pane);
+    lv_obj_remove_style_all(fill);
+    lv_obj_set_width(fill, LV_PCT(100));
+    lv_obj_set_height(fill, LV_PCT(0));
+    lv_obj_align(fill, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(fill, lv_color_hex(0xE6D8B8), 0);  // warm shade fabric
+    lv_obj_set_style_bg_opa(fill, LV_OPA_70, 0);
+    lv_obj_set_style_radius(fill, 3, 0);
+    lv_obj_clear_flag(fill, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(fill, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(fill, LV_OBJ_FLAG_HIDDEN);
+    this->screen_fill_[i] = fill;
+  }
 
   // Control bar: up (open) / stop / down (close) — acts on the selection.
   // Somfy RTS has no feedback, so these are momentary commands, not toggles.
@@ -1056,7 +1290,7 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
   for (int i = 0; i < NUM_SCREENS; i++) {
     if (this->screen_configured_[i])
       this->screen_sel_[i] = true;
-    else
+    else if (this->screen_btn_[i] != nullptr)  // row layout leaves gaps unbuilt
       lv_obj_add_flag(this->screen_btn_[i], LV_OBJ_FLAG_HIDDEN);
   }
 
@@ -1066,14 +1300,43 @@ void PatioUI::build_screens_tile_(lv_obj_t *tile) {
 // ---------------- selection highlight + control state (LVGL task) ----------------
 void PatioUI::update_screen_visual_() {
   bool any_sel = false;
+  bool any_unknown_sel = false;  // a selected cover with no position feedback
+  bool all_open = true;          // every selected+known cover fully open (100)
+  bool all_closed = true;        // every selected+known cover fully closed (0)
+  int known_sel = 0;
   for (int i = 0; i < NUM_SCREENS; i++) {
     if (!this->screen_configured_[i])
       continue;
     lv_obj_t *b = this->screen_btn_[i];
     if (b == nullptr)
       continue;
+
+    // Position-fill overlay: shade drops from the top by (100 - position)%.
+    int pos = this->screen_pos_[i].load();
+    if (this->screen_fill_[i] != nullptr) {
+      if (pos < 0) {
+        lv_obj_add_flag(this->screen_fill_[i], LV_OBJ_FLAG_HIDDEN);
+      } else {
+        int down = 100 - pos;  // how far the blind is lowered
+        lv_obj_set_height(this->screen_fill_[i], LV_PCT(down));
+        if (down <= 0)
+          lv_obj_add_flag(this->screen_fill_[i], LV_OBJ_FLAG_HIDDEN);
+        else
+          lv_obj_clear_flag(this->screen_fill_[i], LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+
     if (this->screen_sel_[i]) {
       any_sel = true;
+      if (pos < 0) {
+        any_unknown_sel = true;
+      } else {
+        known_sel++;
+        if (pos < 100)
+          all_open = false;
+        if (pos > 0)
+          all_closed = false;
+      }
       lv_obj_set_style_border_color(b, COL_SEL, 0);
       lv_obj_set_style_border_width(b, 4, 0);
       lv_obj_set_style_border_opa(b, LV_OPA_COVER, 0);
@@ -1086,12 +1349,18 @@ void PatioUI::update_screen_visual_() {
     }
   }
 
-  // Control buttons are only actionable when at least one screen is selected.
+  // Enablement: Stop is live whenever something is selected. Up/Down additionally
+  // disable at the travel limit — but only when every selected cover has known
+  // position (a selected feedback-less cover, -1, keeps them live).
+  bool limit_known = any_sel && !any_unknown_sel && known_sel > 0;
+  bool up_en = any_sel && !(limit_known && all_open);
+  bool down_en = any_sel && !(limit_known && all_closed);
+  bool en[3] = {up_en, any_sel, down_en};  // up, stop, down
   lv_obj_t *ctrls[3] = {this->ctrl_up_, this->ctrl_stop_, this->ctrl_down_};
   for (int i = 0; i < 3; i++) {
     if (ctrls[i] == nullptr)
       continue;
-    if (any_sel) {
+    if (en[i]) {
       lv_obj_clear_state(ctrls[i], LV_STATE_DISABLED);
       lv_obj_add_flag(ctrls[i], LV_OBJ_FLAG_CLICKABLE);
     } else {
@@ -1410,6 +1679,261 @@ void PatioUI::on_media_title_(std::string title) {
   ESP_LOGD(TAG, "media title -> %s", title.c_str());
 }
 
+// ================= climate (thermostat) tile =================
+// A big centred setpoint with -/+ steppers, current-temperature readout, and
+// mode/fan selector dropdowns along the bottom. Wired to a HA climate entity;
+// both directions are live (HA changes flow back via refresh_climate_ui_()).
+void PatioUI::build_climate_tile_(lv_obj_t *tile) {
+  lv_obj_set_style_bg_color(tile, COL_CLIMATE_OFF, 0);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+  make_tile_title(tile, this->climate_label_.c_str());
+
+  // Current-temperature readout under the title ("Now 76°").
+  this->climate_cur_lbl_ = lv_label_create(tile);
+  lv_obj_set_style_text_color(this->climate_cur_lbl_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->climate_cur_lbl_, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_opa(this->climate_cur_lbl_, LV_OPA_80, 0);
+  lv_label_set_text(this->climate_cur_lbl_, this->climate_celsius_ ? "Now --\xC2\xB0" "C" : "Now --\xC2\xB0" "F");
+  lv_obj_align(this->climate_cur_lbl_, LV_ALIGN_TOP_MID, 0, 36);
+
+  // Big centred setpoint ("68°"). montserrat_48 carries the degree glyph.
+  this->climate_set_lbl_ = lv_label_create(tile);
+  lv_obj_set_style_text_color(this->climate_set_lbl_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->climate_set_lbl_, &lv_font_montserrat_48, 0);
+  lv_label_set_text(this->climate_set_lbl_, this->climate_celsius_ ? "--\xC2\xB0" "C" : "--\xC2\xB0" "F");
+  lv_obj_align(this->climate_set_lbl_, LV_ALIGN_CENTER, 0, -18);
+
+  // Big round -/+ steppers flanking the setpoint. Use the built-in symbol
+  // glyphs (montserrat lacks the U+2212 minus, which rendered as a box).
+  lv_obj_t *b_down = make_btn(tile, LV_SYMBOL_MINUS, ev_climate_down, this);
+  lv_obj_set_size(b_down, 66, 66);
+  lv_obj_set_style_radius(b_down, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_text_font(lv_obj_get_child(b_down, 0), &lv_font_montserrat_28, 0);
+  lv_obj_align(b_down, LV_ALIGN_LEFT_MID, 12, -18);
+
+  lv_obj_t *b_up = make_btn(tile, LV_SYMBOL_PLUS, ev_climate_up, this);
+  lv_obj_set_size(b_up, 66, 66);
+  lv_obj_set_style_radius(b_up, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_text_font(lv_obj_get_child(b_up, 0), &lv_font_montserrat_28, 0);
+  lv_obj_align(b_up, LV_ALIGN_RIGHT_MID, -12, -18);
+
+  // Bottom row: mode selector (left) + fan selector (right). Dropdowns so a
+  // mode can be picked directly (Off is a normal choice, not a toggle stop).
+  // Lists open upward — there's little room below on the tile.
+  this->climate_mode_dd_ = lv_dropdown_create(tile);
+  lv_dropdown_set_options(this->climate_mode_dd_, "Off\nCool\nHeat\nAuto");
+  lv_dropdown_set_dir(this->climate_mode_dd_, LV_DIR_TOP);
+  lv_dropdown_set_symbol(this->climate_mode_dd_, NULL);
+  lv_obj_set_size(this->climate_mode_dd_, 138, 46);
+  lv_obj_align(this->climate_mode_dd_, LV_ALIGN_BOTTOM_LEFT, 14, -30);
+  lv_obj_set_style_bg_color(this->climate_mode_dd_, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(this->climate_mode_dd_, LV_OPA_30, 0);
+  lv_obj_set_style_border_width(this->climate_mode_dd_, 0, 0);
+  lv_obj_set_style_text_color(this->climate_mode_dd_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->climate_mode_dd_, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_align(this->climate_mode_dd_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_add_event_cb(this->climate_mode_dd_, ev_climate_mode, LV_EVENT_VALUE_CHANGED, this);
+
+  this->climate_fan_dd_ = lv_dropdown_create(tile);
+  lv_dropdown_set_options(this->climate_fan_dd_, "Auto\nLow\nMed\nHigh");
+  lv_dropdown_set_dir(this->climate_fan_dd_, LV_DIR_TOP);
+  lv_dropdown_set_symbol(this->climate_fan_dd_, NULL);
+  lv_obj_set_size(this->climate_fan_dd_, 138, 46);
+  lv_obj_align(this->climate_fan_dd_, LV_ALIGN_BOTTOM_RIGHT, -14, -30);
+  lv_obj_set_style_bg_color(this->climate_fan_dd_, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(this->climate_fan_dd_, LV_OPA_30, 0);
+  lv_obj_set_style_border_width(this->climate_fan_dd_, 0, 0);
+  lv_obj_set_style_text_color(this->climate_fan_dd_, lv_color_white(), 0);
+  lv_obj_set_style_text_font(this->climate_fan_dd_, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_align(this->climate_fan_dd_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_add_event_cb(this->climate_fan_dd_, ev_climate_fan, LV_EVENT_VALUE_CHANGED, this);
+
+  // No entity bound -> show a disabled placeholder rather than dead controls.
+  if (!this->climate_configured_) {
+    lv_label_set_text(this->climate_cur_lbl_, "(no climate entity)");
+    lv_obj_t *ctrls[4] = {b_down, b_up, this->climate_mode_dd_, this->climate_fan_dd_};
+    for (auto *c : ctrls) {
+      lv_obj_add_state(c, LV_STATE_DISABLED);
+      lv_obj_clear_flag(c, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_opa(c, LV_OPA_40, 0);
+    }
+  }
+}
+
+// Reflect last-known HA state onto the climate tile (LVGL task).
+void PatioUI::refresh_climate_ui_() {
+  if (!this->climate_configured_)
+    return;
+  int mode = this->climate_mode_.load();
+  if (mode < 0 || mode >= CLM_COUNT)
+    mode = CLM_OFF;
+
+  // Tile background follows the mode (cool=blue, heat=orange, auto=teal, else slate).
+  lv_color_t bg = COL_CLIMATE_OFF;
+  if (mode == CLM_COOL || mode == CLM_DRY || mode == CLM_FAN)
+    bg = COL_CLIMATE_COOL;
+  else if (mode == CLM_HEAT)
+    bg = COL_CLIMATE_HEAT;
+  else if (mode == CLM_AUTO)
+    bg = COL_CLIMATE_AUTO;
+  lv_obj_set_style_bg_color(this->climate_tile_, bg, 0);
+
+  // Current temperature line ("Now 76°C"), or hide the number when unknown.
+  const char *unit = this->climate_celsius_ ? "C" : "F";
+  if (this->climate_cur_lbl_ != nullptr) {
+    int cx = this->climate_cur_x10_.load();
+    char b[24];
+    if (cx == -10000)
+      snprintf(b, sizeof(b), "Now --\xC2\xB0%s", unit);
+    else
+      snprintf(b, sizeof(b), "Now %d\xC2\xB0%s", (cx + (cx >= 0 ? 5 : -5)) / 10, unit);
+    lv_label_set_text(this->climate_cur_lbl_, b);
+  }
+
+  // Big setpoint. When off, show a dash instead of a stale number.
+  if (this->climate_set_lbl_ != nullptr) {
+    int tx = this->climate_target_x10_.load();
+    char b[16];
+    if (mode == CLM_OFF || tx == -10000)
+      snprintf(b, sizeof(b), "--\xC2\xB0%s", unit);
+    else if (this->climate_step_ < 0.99f && (tx % 10) != 0)
+      snprintf(b, sizeof(b), "%d.%d\xC2\xB0%s", tx / 10, (tx % 10 < 0 ? -tx % 10 : tx % 10), unit);
+    else
+      snprintf(b, sizeof(b), "%d\xC2\xB0%s", (tx + (tx >= 0 ? 5 : -5)) / 10, unit);
+    lv_label_set_text(this->climate_set_lbl_, b);
+  }
+
+  // Sync the selector dropdowns to the current mode/fan. lv_dropdown_set_selected
+  // does not fire an event, so there's no feedback loop.
+  if (this->climate_mode_dd_ != nullptr) {
+    int sel = -1;
+    for (int i = 0; i < CLIMATE_MODE_CYCLE_N; i++) {
+      if (CLIMATE_MODE_CYCLE[i] == mode) {
+        sel = i;
+        break;
+      }
+    }
+    // Modes outside the selectable set (dry/fan_only) leave the selection as-is;
+    // the tile background still reflects the true mode above.
+    if (sel >= 0)
+      lv_dropdown_set_selected(this->climate_mode_dd_, sel);
+  }
+  if (this->climate_fan_dd_ != nullptr) {
+    int fan = this->climate_fan_.load();
+    if (fan < 0 || fan >= CLIMATE_FAN_N)
+      fan = 0;
+    lv_dropdown_set_selected(this->climate_fan_dd_, fan);
+  }
+}
+
+// ---------------- climate intents (LVGL task) ----------------
+void PatioUI::request_climate_setpoint(int delta_steps) {
+  if (!this->climate_configured_)
+    return;
+  int step10 = static_cast<int>(this->climate_step_ * 10.0f + 0.5f);
+  if (step10 <= 0)
+    step10 = 10;
+  int cur = this->climate_target_x10_.load();
+  if (cur == -10000)  // no known setpoint yet — seed at the min
+    cur = static_cast<int>(this->climate_min_ * 10.0f + 0.5f);
+  int next = cur + delta_steps * step10;
+  int lo = static_cast<int>(this->climate_min_ * 10.0f + 0.5f);
+  int hi = static_cast<int>(this->climate_max_ * 10.0f + 0.5f);
+  if (next < lo)
+    next = lo;
+  if (next > hi)
+    next = hi;
+  this->climate_target_x10_.store(next);           // optimistic
+  this->pending_climate_target_x10_.store(next);   // main task sends it
+  this->climate_ui_dirty_.store(true);
+}
+
+void PatioUI::request_climate_mode_index(int idx) {
+  if (!this->climate_configured_)
+    return;
+  if (idx < 0 || idx >= CLIMATE_MODE_CYCLE_N)
+    return;
+  int mode = CLIMATE_MODE_CYCLE[idx];
+  this->climate_mode_.store(mode);                 // optimistic
+  this->pending_climate_mode_.store(mode);
+  this->climate_ui_dirty_.store(true);
+}
+
+void PatioUI::request_climate_fan_index(int idx) {
+  if (!this->climate_configured_)
+    return;
+  if (idx < 0 || idx >= CLIMATE_FAN_N)
+    return;
+  this->climate_fan_.store(idx);                   // optimistic
+  this->pending_climate_fan_.store(idx);
+  this->climate_ui_dirty_.store(true);
+}
+
+// ---------------- climate HA -> UI callbacks (main/API task) ----------------
+void PatioUI::on_climate_state_(std::string state) {
+  int mode = CLM_OFF;
+  for (int i = 0; i < CLM_COUNT; i++) {
+    if (state == CLIMATE_MODE_HA[i]) {
+      mode = i;
+      break;
+    }
+  }
+  this->climate_mode_.store(mode);
+  this->climate_ui_dirty_.store(true);
+  ESP_LOGD(TAG, "climate mode -> %s (%d)", state.c_str(), mode);
+}
+void PatioUI::on_climate_action_(std::string action) {
+  int a = 0;
+  if (action == "heating")
+    a = 1;
+  else if (action == "cooling")
+    a = 2;
+  else if (action == "drying")
+    a = 3;
+  else if (action == "fan")
+    a = 4;
+  this->climate_action_.store(a);
+  this->climate_ui_dirty_.store(true);
+}
+void PatioUI::on_climate_cur_temp_(std::string v) {
+  char *end = nullptr;
+  float f = strtof(v.c_str(), &end);
+  if (end != v.c_str()) {
+    if (this->climate_celsius_)
+      f = (f - 32.0f) * 5.0f / 9.0f;
+    this->climate_cur_x10_.store(static_cast<int>(f * 10.0f + (f >= 0 ? 0.5f : -0.5f)));
+    this->climate_ui_dirty_.store(true);
+  }
+}
+void PatioUI::on_climate_target_temp_(std::string v) {
+  char *end = nullptr;
+  float f = strtof(v.c_str(), &end);
+  if (end != v.c_str()) {
+    if (this->climate_celsius_)
+      f = (f - 32.0f) * 5.0f / 9.0f;
+    // Ignore the echo of a setpoint the user is mid-adjusting only if a send is
+    // still pending; otherwise trust HA as the source of truth.
+    if (this->pending_climate_target_x10_.load() == -10000)
+      this->climate_target_x10_.store(static_cast<int>(f * 10.0f + (f >= 0 ? 0.5f : -0.5f)));
+    this->climate_ui_dirty_.store(true);
+  }
+}
+void PatioUI::on_climate_fan_(std::string v) {
+  // Map HA fan names (which include diffuse/middle on this unit) to our 4 slots.
+  int fan = 0;
+  if (v == "low" || v == "diffuse")
+    fan = 1;
+  else if (v == "medium" || v == "middle")
+    fan = 2;
+  else if (v == "high")
+    fan = 3;
+  else
+    fan = 0;  // auto (and anything unexpected)
+  if (this->pending_climate_fan_.load() == -1)
+    this->climate_fan_.store(fan);
+  this->climate_ui_dirty_.store(true);
+}
+
 // ---------------- screen intents (LVGL task) ----------------
 void PatioUI::add_screen(int slot, const std::string &entity, const std::string &label) {
   if (slot < 0 || slot >= NUM_SCREENS)
@@ -1511,6 +2035,40 @@ int PatioUI::light_index_for_entity_(const std::string &entity_id) const {
       return i;
   }
   return -1;
+}
+
+int PatioUI::screen_index_for_entity_(const std::string &entity_id) const {
+  for (int i = 0; i < NUM_SCREENS; i++) {
+    if (this->screen_configured_[i] && this->screen_entity_[i] == entity_id)
+      return i;
+  }
+  return -1;
+}
+
+// Cover position feedback (Lutron etc.): 0=closed/down, 100=open/up. Empty /
+// "unknown" / "None" leave the sentinel -1 so the button-disable logic treats
+// the cover as position-less (like Somfy RTS).
+void PatioUI::on_screen_position_(std::string entity_id, std::string position) {
+  int idx = this->screen_index_for_entity_(entity_id);
+  if (idx < 0)
+    return;
+  if (position.empty() || position == "unknown" || position == "unavailable" || position == "None") {
+    this->screen_pos_[idx].store(-1);
+  } else {
+    char *end = nullptr;
+    long p = strtol(position.c_str(), &end, 10);
+    if (end == position.c_str()) {
+      this->screen_pos_[idx].store(-1);
+    } else {
+      if (p < 0)
+        p = 0;
+      if (p > 100)
+        p = 100;
+      this->screen_pos_[idx].store(static_cast<int>(p));
+    }
+  }
+  this->screen_ui_dirty_.store(true);
+  ESP_LOGD(TAG, "screen[%d] position %s", idx, position.c_str());
 }
 
 // UI -> HA intents (called from the LVGL task; only touch atomics).
@@ -1802,8 +2360,113 @@ void PatioUI::write_rtc_from_system_() {
     ESP_LOGD(TAG, "RTC: persisted HA time to chip");
 }
 
+#ifdef PATIO_AUDIO
+// On-demand audio hardware self-test for the CoreS3 (NOT called at boot -- the
+// patio_ui `speaker`/`microphone` platforms now own the codecs). Retained as a
+// standalone bring-up diagnostic: call manually to prove the path. Uses the BSP
+// codec init (bsp_audio_codec_speaker_init -> AW88298,
+// bsp_audio_codec_microphone_init -> ES7210), which internally brings up the
+// shared duplex I2S bus, reuses the BSP's I2C bus, drives the AW9523 speaker/mic
+// enable, and sets the amp gain. Pushes a short 440 Hz tone out the speaker and
+// reads a slice of mic audio back, logging RMS + peak so a level that tracks the
+// room proves the capture path. Blocks ~1 s.
+void PatioUI::audio_selftest_() {
+  esp_codec_dev_handle_t spk = bsp_audio_codec_speaker_init();
+  esp_codec_dev_handle_t mic = bsp_audio_codec_microphone_init();
+  if (spk == nullptr || mic == nullptr) {
+    ESP_LOGE(TAG, "audio selftest: codec init failed (spk=%p mic=%p)", spk, mic);
+    return;
+  }
+
+  esp_codec_dev_sample_info_t fs = {};
+  fs.bits_per_sample = 16;
+  fs.channel = 1;
+  fs.channel_mask = 0;
+  fs.sample_rate = 16000;
+  fs.mclk_multiple = 0;
+
+  // --- Playback: ~0.5 s of 440 Hz sine, near full-scale (the onboard 1 W
+  // speaker is quiet, so drive it hard). Buffer MUST come from PSRAM: internal
+  // RAM is nearly exhausted by the LVGL draw buffers + IRAM, so a plain malloc
+  // returns null here. ---
+  const int spk_samples = 16000 / 2;
+  int16_t *tone = static_cast<int16_t *>(heap_caps_malloc(spk_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  if (tone != nullptr) {
+    for (int i = 0; i < spk_samples; i++)
+      tone[i] = static_cast<int16_t>(28000.0f * sinf(2.0f * (float) M_PI * 440.0f * i / 16000.0f));
+    esp_codec_dev_set_out_vol(spk, 100);  // no-op before open; must be set after
+    if (esp_codec_dev_open(spk, &fs) == ESP_OK) {
+      // The BSP configures the AW88298 with hw_gain.pa_gain=15, so the driver's
+      // set_vol() subtracts 15 dB -> esp_codec_dev_set_out_vol(spk,100) only
+      // reaches -15 dB digital. Force the volume register (0x0C) to true 0 dB
+      // directly over the BSP's shared I2C bus (AW88298 @ 0x36). This is a
+      // DIGITAL-only write (high byte = attenuation; 0x00 = 0 dB, low byte 0x64
+      // as the driver uses) -- no analog/boost change, so no hardware risk. The
+      // boost converter (REG61) is already enabled at 0x0673 by the driver;
+      // 0x6673 is only the boost-off power-on default.
+      // TODO(upstream): the BSP buries pa_gain=15 with no way to reach 0 dB via
+      // the public API -- expose it or drop the offset.
+      esp_codec_dev_set_out_vol(spk, 100);  // now is_open==true -> writes -15 dB
+      i2c_master_bus_handle_t abus = bsp_i2c_get_handle();
+      if (abus != nullptr) {
+        i2c_device_config_t aw_cfg = {};
+        aw_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        aw_cfg.device_address = 0x36;  // AW88298
+        aw_cfg.scl_speed_hz = 100000;
+        i2c_master_dev_handle_t aw = nullptr;
+        if (i2c_master_bus_add_device(abus, &aw_cfg, &aw) == ESP_OK) {
+          const uint8_t vol_0db[] = {0x0C, 0x00, 0x64};  // REG0C hi=0x00 -> 0 dB
+          if (i2c_master_transmit(aw, vol_0db, sizeof(vol_0db), 1000) != ESP_OK)
+            ESP_LOGW(TAG, "audio selftest: AW88298 vol write failed");
+          i2c_master_bus_rm_device(aw);
+        }
+      }
+      esp_codec_dev_dump_reg(spk);  // log actual REG0C/REG61 for ground truth
+      esp_codec_dev_write(spk, tone, spk_samples * sizeof(int16_t));
+      esp_codec_dev_close(spk);
+    } else {
+      ESP_LOGE(TAG, "audio selftest: speaker open failed");
+    }
+    free(tone);
+  } else {
+    ESP_LOGE(TAG, "audio selftest: tone alloc failed");
+  }
+
+  // --- Capture: ~0.5 s, report RMS + peak so a non-trivial level confirms the
+  // ES7210 mics are live. ---
+  const int mic_samples = 16000 / 2;
+  int16_t *cap = static_cast<int16_t *>(heap_caps_malloc(mic_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  if (cap != nullptr) {
+    esp_codec_dev_set_in_gain(mic, 30.0f);
+    if (esp_codec_dev_open(mic, &fs) == ESP_OK) {
+      if (esp_codec_dev_read(mic, cap, mic_samples * sizeof(int16_t)) == ESP_OK) {
+        double sumsq = 0.0;
+        int peak = 0;
+        for (int i = 0; i < mic_samples; i++) {
+          sumsq += static_cast<double>(cap[i]) * cap[i];
+          int a = cap[i] < 0 ? -cap[i] : cap[i];
+          if (a > peak)
+            peak = a;
+        }
+        ESP_LOGI(TAG, "audio selftest: OK — tone played, mic RMS=%.1f peak=%d",
+                 sqrt(sumsq / mic_samples), peak);
+      } else {
+        ESP_LOGE(TAG, "audio selftest: mic read failed");
+      }
+      esp_codec_dev_close(mic);
+    } else {
+      ESP_LOGE(TAG, "audio selftest: mic open failed");
+    }
+    free(cap);
+  } else {
+    ESP_LOGE(TAG, "audio selftest: capture alloc failed");
+  }
+}
+#endif  // PATIO_AUDIO
+
 void PatioUI::setup() {
-  ESP_LOGI(TAG, "bringing up Core2 display + LVGL");
+  ESP_LOGI(TAG, "bringing up display + LVGL");
+
 
   // The BSP (our esp-bsp fork) initialises the new-i2c bus, powers the AXP2101
   // LCD rails and pulses the ALDO2 LCD/touch reset itself, then brings up the
@@ -1866,6 +2529,16 @@ void PatioUI::setup() {
   this->build_ui_();
   bsp_display_unlock();
 
+  // Fling-smoothness fix: the esp_lvgl_port task over-sleeps between frames (its
+  // loop sleeps up to task_max_sleep_ms=500 ms whenever lv_timer_handler()
+  // reports no imminent timer), so an active scroll animation's elapsed-time
+  // calc jumps it to completion in 1-2 giant steps instead of stepping smoothly.
+  // A persistent high-frequency no-op timer forces lv_timer_handler() to always
+  // report work due within 5 ms, so the port task can never fall into the 500 ms
+  // sleep. Confirmed on hardware to be the root-cause fix for choppy flings —
+  // this is load-bearing, do not remove.
+  lv_timer_create([](lv_timer_t *) {}, 5, nullptr);
+
   // Restore the persisted finish time BEFORE subscribing to HA. On a warm reboot
   // the ESP32 RTC keeps real wall-clock time, so we can show the running
   // countdown immediately rather than waiting for HA to reconnect (~30 s). HA's
@@ -1892,9 +2565,9 @@ void PatioUI::setup() {
 
   // If a timer is already running at boot, rest on the heater tile so the
   // countdown is visible immediately (otherwise start on the clock tile).
-  if (this->active_.load() && this->tv_ != nullptr) {
+  if (this->active_.load() && this->tv_ != nullptr && this->heater_tile_ != nullptr) {
     bsp_display_lock(0);
-    lv_tileview_set_tile(this->tv_, this->tiles_[TILE_HEATER], LV_ANIM_OFF);
+    lv_tileview_set_tile(this->tv_, this->heater_tile_, LV_ANIM_OFF);
     this->update_page_dots_();
     bsp_display_unlock();
   }
@@ -1908,9 +2581,17 @@ void PatioUI::setup() {
   this->subscribe_homeassistant_state(&PatioUI::on_outside_temp_, this->temp_sensor_);
   this->subscribe_homeassistant_state(&PatioUI::on_temp_unit_, this->temp_sensor_, "unit_of_measurement");
 
-  // Screens are Somfy RTS (command-only, no reliable state feedback), so we
-  // don't subscribe to their state — the tiles are selectors + momentary
-  // up/stop/down commands.
+  // Screens: Somfy RTS is command-only (no feedback), but position-reporting
+  // covers (Lutron etc.) publish current_position — subscribe so we can disable
+  // up/down at the travel limits and draw a position-fill indicator. Covers
+  // that never report position keep the sentinel -1 and are never disabled.
+  for (int i = 0; i < NUM_SCREENS; i++) {
+    this->screen_pos_[i].store(-1);
+    if (this->screen_configured_[i])
+      this->subscribe_homeassistant_state(&PatioUI::on_screen_position_, this->screen_entity_[i],
+                                          "current_position");
+  }
+  this->screen_ui_dirty_.store(true);
 
   // Lights are bidirectional: init per-light atomics, then subscribe to HA so
   // the faders reflect external changes (and toggles can restore last level).
@@ -1936,6 +2617,21 @@ void PatioUI::setup() {
     this->subscribe_homeassistant_state(&PatioUI::on_media_title_, this->media_entity_, "media_title");
   }
   this->media_ui_dirty_.store(true);
+
+  // Climate/thermostat: subscribe to the hvac mode (state) plus the attributes
+  // we render, and init the pending-intent sentinels.
+  this->pending_climate_target_x10_.store(-10000);
+  this->pending_climate_mode_.store(-1);
+  this->pending_climate_fan_.store(-1);
+  if (this->climate_configured_) {
+    this->subscribe_homeassistant_state(&PatioUI::on_climate_state_, this->climate_entity_);
+    this->subscribe_homeassistant_state(&PatioUI::on_climate_action_, this->climate_entity_, "hvac_action");
+    this->subscribe_homeassistant_state(&PatioUI::on_climate_cur_temp_, this->climate_entity_,
+                                        "current_temperature");
+    this->subscribe_homeassistant_state(&PatioUI::on_climate_target_temp_, this->climate_entity_, "temperature");
+    this->subscribe_homeassistant_state(&PatioUI::on_climate_fan_, this->climate_entity_, "fan_mode");
+  }
+  this->climate_ui_dirty_.store(true);
 
   ESP_LOGI(TAG, "UI up; heater tile bound to %s", this->timer_entity_.c_str());
 
@@ -1963,6 +2659,10 @@ void PatioUI::loop() {
       this->last_status_poll_ms_ = nowms;
     }
   }
+
+  // On battery, drop into deep sleep once the screen has been idle-asleep long
+  // enough (never on USB). Runs on the main task with a fresh on_battery_.
+  this->maybe_deep_sleep_();
 
   // Drain button intents on the main task, where the native API lives.
   int start_m = this->pending_start_.exchange(-1);
@@ -2045,6 +2745,33 @@ void PatioUI::loop() {
       this->call_homeassistant_service(svc3, {{"entity_id", this->media_entity_}});
     }
   }
+
+  // Drain pending climate intents against the thermostat.
+  if (this->climate_configured_) {
+    int ct = this->pending_climate_target_x10_.exchange(-10000);
+    if (ct != -10000) {
+      float send = ct / 10.0f;
+      if (this->climate_celsius_)  // stored/displayed °C -> HA wants °F
+        send = send * 9.0f / 5.0f + 32.0f;
+      char t[16];
+      snprintf(t, sizeof(t), "%.1f", send);
+      ESP_LOGI(TAG, "climate setpoint %s -> %s", t, this->climate_entity_.c_str());
+      this->call_homeassistant_service("climate.set_temperature",
+                                       {{"entity_id", this->climate_entity_}, {"temperature", t}});
+    }
+    int cm = this->pending_climate_mode_.exchange(-1);
+    if (cm >= 0 && cm < CLM_COUNT) {
+      ESP_LOGI(TAG, "climate mode %s -> %s", CLIMATE_MODE_HA[cm], this->climate_entity_.c_str());
+      this->call_homeassistant_service(
+          "climate.set_hvac_mode", {{"entity_id", this->climate_entity_}, {"hvac_mode", CLIMATE_MODE_HA[cm]}});
+    }
+    int cf = this->pending_climate_fan_.exchange(-1);
+    if (cf >= 0 && cf < CLIMATE_FAN_N) {
+      ESP_LOGI(TAG, "climate fan %s -> %s", CLIMATE_FAN_HA[cf], this->climate_entity_.c_str());
+      this->call_homeassistant_service(
+          "climate.set_fan_mode", {{"entity_id", this->climate_entity_}, {"fan_mode", CLIMATE_FAN_HA[cf]}});
+    }
+  }
 }
 
 void PatioUI::dump_config() {
@@ -2065,6 +2792,9 @@ void PatioUI::dump_config() {
   }
   if (this->media_configured_)
     ESP_LOGCONFIG(TAG, "  media     %-9s -> %s", this->media_label_.c_str(), this->media_entity_.c_str());
+  if (this->climate_configured_)
+    ESP_LOGCONFIG(TAG, "  climate   %-9s -> %s (%.0f..%.0f step %.1f)", this->climate_label_.c_str(),
+                  this->climate_entity_.c_str(), this->climate_min_, this->climate_max_, this->climate_step_);
 }
 
 }  // namespace patio_ui

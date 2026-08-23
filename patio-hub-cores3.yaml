@@ -3,7 +3,7 @@
 #
 # Sibling of patio-hub.yaml (Core2). Everything board-INDEPENDENT lives in
 # common/patio-hub-common.yaml; this entrypoint only swaps in the CoreS3
-# board + its OCTAL PSRAM, and flips the patio_ui `variant` to cores3 so the
+# board + its PSRAM, and flips the patio_ui `variant` to cores3 so the
 # component pulls the m5stack_core_s3 BSP instead of the Core2 one.
 #
 # The CoreS3 shares the Core2's 320x240 panel + AXP2101 PMU, so the entire UI
@@ -28,13 +28,37 @@ esphome:
 
 esp32:
   board: m5stack-cores3
+  # CoreS3 ships 16 MB flash; the ESPHome default (4 MB) caps each OTA app slot
+  # at 1.75 MB, which overflows once voice_assistant + micro_wake_word + the
+  # wake-word model are added. Declaring the real size lets ESPHome auto-generate
+  # much larger app partitions.
+  flash_size: 16MB
   framework:
     type: esp-idf
+    # ROOT-CAUSE FIX for the "is unresponsive; disconnecting" API flap:
+    # ESPHome/the BSP leave PSRAM in caps-alloc-only mode
+    # (CONFIG_SPIRAM_USE_CAPS_ALLOC), so PSRAM is only reachable via an explicit
+    # heap_caps_malloc(MALLOC_CAP_SPIRAM). WiFi, LWIP (TCP/IP), mbedTLS and every
+    # plain malloc() are therefore forced into the ~512 KB of INTERNAL RAM. With
+    # the audio stack added, internal free heap runs down to a few hundred bytes
+    # (measured: heap_min=620 bytes) while 8.3 MB of PSRAM sits unused — so when
+    # HA sends data the device can't allocate an internal TCP/crypto buffer, the
+    # API stalls, HA marks it unresponsive and disconnects, and the reconnect
+    # handshake fails for the same reason. The Core2 (no audio) never hit this.
+    #   USE_MALLOC integrates PSRAM into the general heap; TRY_ALLOCATE_WIFI_LWIP
+    # then pushes the big WiFi/LWIP buffers out to PSRAM, freeing internal RAM.
+    # RESERVE_INTERNAL keeps a DMA-capable internal pool so I2S/display DMA and
+    # small hot allocations stay fast and DMA-safe.
+    sdkconfig_options:
+      CONFIG_SPIRAM_USE_MALLOC: y
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: y
+      CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL: "32768"
 
-# CoreS3 is an ESP32-S3-WROOM-1 N16R8 -> 8 MB *octal* PSRAM (the Core2's `quad`
-# will not boot here).
+# CoreS3 is an ESP32-S3-WROOM-1 module with 8 MB *quad* PSRAM. Despite the
+# "N16R8" naming, the chip is quad-line, not octal: `mode: octal` reports
+# "PSRAM chip is not connected" and disables PSRAM. Verified on hardware.
 psram:
-  mode: octal
+  mode: quad
   speed: 80MHz
 
 packages:
@@ -45,3 +69,109 @@ packages:
 # all entity config is inherited from the common package.
 patio_ui:
   variant: cores3
+
+# The common package sets logger level DEBUG. On the CoreS3 the voice stack
+# (voice_assistant streams mic audio over the native API) plus the UI's very
+# chatty DEBUG output saturates the API TX buffer — "Buffer full, ping queued"
+# — which makes Home Assistant mark the device unresponsive and disconnect,
+# killing the pipeline mid-run. INFO keeps the loop light and the API buffer
+# clear. (Override merges over the package's logger block.)
+logger:
+  level: INFO
+
+# CoreS3 onboard audio, exposed as ESPHome surfaces through the same esp-bsp /
+# esp_codec_dev stack the UI already pulls (no second BSP fetch). Both run at
+# 16 kHz on the shared duplex I2S bus — the rate micro_wake_word / voice_assistant
+# want — so mic and speaker must stay in lockstep on sample rate.
+microphone:
+  - platform: patio_ui
+    id: patio_mic
+    gain_db: 40
+
+speaker:
+  - platform: patio_ui
+    id: patio_speaker
+
+# ---------------------------------------------------------------------------
+# Natural-language voice control (half-duplex, no AEC yet).
+#
+# Flow: micro_wake_word runs on-device continuously against the ES7210 mic and,
+# on "Okay Nabu", starts the voice_assistant pipeline. voice_assistant streams
+# mic audio to Home Assistant for STT + intent, then plays the TTS reply back
+# through the AW88298 speaker. Because we have no acoustic echo canceller yet,
+# the stages never overlap: while VA is active the wake word is paused, mic
+# capture (STT) and speaker playback (TTS) happen in separate phases, and VA
+# auto-restarts the wake word when the pipeline ends. Both mic + speaker open
+# the shared duplex I2S bus at 16 kHz, so they stay rate-locked.
+#
+# micro_wake_word + voice_assistant are CoreS3-only (they reference patio_mic /
+# patio_speaker, which don't exist on the Core2), so they live here rather than
+# in the shared common package.
+# ---------------------------------------------------------------------------
+micro_wake_word:
+  id: patio_mww
+  microphone:
+    microphone: patio_mic
+  models:
+    - model: okay_nabu
+      # The okay_nabu model ships a very strict 0.97 default cutoff which misses
+      # normal-volume speech. 0.7 was still hard to trigger reliably at a
+      # patio-normal distance/volume, so drop to 0.5 — a well-tested, still
+      # phrase-specific value that wakes far more reliably without a flood of
+      # false triggers on ambient patio noise.
+      probability_cutoff: 0.5
+  on_wake_word_detected:
+    - voice_assistant.start:
+
+voice_assistant:
+  id: patio_va
+  micro_wake_word: patio_mww
+  microphone:
+    microphone: patio_mic
+  speaker: patio_speaker
+  # Half-duplex, no AEC: the TTS reply plays out the speaker into the same
+  # enclosure as the mic, so if the wake word resumes while the reply is still
+  # audible the reply audio false-triggers "Okay Nabu" (observed: avg prob 0.59,
+  # max 1.00). That phantom detection desyncs the mww<->VA state machine and
+  # leaves the wake word stopped/deaf until the next reboot. So instead of a
+  # fixed 200ms delay, wait for the speaker to actually finish draining the
+  # reply, then hold a short guard for the acoustic tail/echo, and only THEN
+  # resume wake-word detection.
+  on_end:
+    - delay: 300ms  # let TTS playback reach the speaker (state -> RUNNING)
+    - wait_until:
+        condition:
+          not:
+            speaker.is_playing: patio_speaker
+        timeout: 8s  # safety net: always resume mww even if drain detection wedges
+    - delay: 500ms  # guard: let the reply's acoustic tail die out before listening
+    - micro_wake_word.start:
+        id: patio_mww
+  # If the pipeline errors out, make sure the wake word engine comes back. Same
+  # speaker-drain guard in case the error arrived mid-playback.
+  on_error:
+    - delay: 300ms
+    - wait_until:
+        condition:
+          not:
+            speaker.is_playing: patio_speaker
+        timeout: 8s
+    - delay: 500ms
+    - micro_wake_word.start:
+        id: patio_mww
+
+# micro_wake_word boots in the STOPPED state and nothing starts it on its own;
+# voice_assistant only *re-*starts it (via on_end above) after a detection. So
+# kick it off when Home Assistant connects (a detection is only useful once HA
+# is there to run the pipeline). We deliberately do NOT stop it on disconnect:
+# HA's API connection can briefly flap, and stopping mww on every flap left the
+# wake word deaf for seconds at a time. Leaving it running is harmless (a
+# detection during a flap just no-ops until HA is back) and far more robust.
+api:
+  on_client_connected:
+    - if:
+        condition:
+          lambda: 'return client_info.find("Home Assistant") == 0;'
+        then:
+          - micro_wake_word.start:
+              id: patio_mww

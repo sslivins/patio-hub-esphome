@@ -45,4 +45,26 @@ psram:
 packages:
   common: !include common/patio-hub-common.yaml
 
+# On-battery deep sleep with FT6336 tap-wake (Core2-specific). GPIO39 is the
+# touch controller INT — an RTC-capable pin, so it can wake the ESP32 from deep
+# sleep via ext0. The panel/touch rail (ALDO2) stays powered while asleep so a
+# tap is still detected; only the backlight rail (BLDO1) is cut by the UI's
+# screen-sleep. No sleep_duration/run_duration -> the device only sleeps when
+# the patio_ui policy asks (on battery + screen idle), never on USB, and never
+# on a timer — so there are zero periodic wake bursts. A tap reboots straight
+# back into the UI (OTA can ride on any user-initiated wake).
+deep_sleep:
+  id: deep_sleep_ctl
+  wakeup_pin:
+    number: GPIO39
+    inverted: true            # touch INT is active-low
+  wakeup_pin_mode: INVERT_WAKEUP
+
+# Wire the UI's deep-sleep policy trigger to the board's deep_sleep mechanism.
+# Package-merged into the shared patio_ui defined in common/ (which owns the
+# `id` + all entity config); `variant` still defaults to core2 here.
+patio_ui:
+  on_deep_sleep_request:
+    - deep_sleep.enter: deep_sleep_ctl
+
 # patio_ui `variant` defaults to core2, so no override is needed here.
