@@ -25,6 +25,20 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  on_boot:
+    # micro_wake_word sets up at AFTER_CONNECTION (prio 100) and only owns its
+    # WakeWordModel list after that setup() runs, so apply the restored/initial
+    # sensitivity late (prio -300, after all component setups) to be sure
+    # get_wake_words() is populated.
+    - priority: -300
+      then:
+        - lambda: |-
+            float pct = id(mww_cutoff).state;
+            if (isnan(pct)) return;
+            uint8_t cutoff = (uint8_t) lroundf(pct / 100.0f * 255.0f);
+            for (auto *m : id(patio_mww)->get_wake_words())
+              m->set_probability_cutoff(cutoff);
+            ESP_LOGI("mww_cutoff", "boot: applied cutoff %u/255 (%.0f%%)", cutoff, pct);
 
 esp32:
   board: m5stack-cores3
@@ -113,13 +127,12 @@ micro_wake_word:
   microphone:
     microphone: patio_mic
   models:
-    - model: okay_nabu
-      # The okay_nabu model ships a very strict 0.97 default cutoff which misses
-      # normal-volume speech. 0.7 was still hard to trigger reliably at a
-      # patio-normal distance/volume, so drop to 0.5 — a well-tested, still
-      # phrase-specific value that wakes far more reliably without a flood of
-      # false triggers on ambient patio noise.
-      probability_cutoff: 0.5
+    - model: hey_jarvis
+      # The stock models ship a very strict 0.97 default cutoff which misses
+      # normal-volume speech. This is only the compile-time baseline: the
+      # "Wake Word Sensitivity" number entity (below) overrides it at runtime and
+      # on boot. 0.75 (== 75%) is the default the number restores to.
+      probability_cutoff: 0.75
   on_wake_word_detected:
     - voice_assistant.start:
 
@@ -129,6 +142,10 @@ voice_assistant:
   microphone:
     microphone: patio_mic
   speaker: patio_speaker
+  # Show the pulsing "listening" glow border the moment a wake word starts a
+  # pipeline, and clear it as soon as the pipeline ends or errors out.
+  on_start:
+    - lambda: 'id(patio_hub_ui)->set_voice_listening(true);'
   # Half-duplex, no AEC: the TTS reply plays out the speaker into the same
   # enclosure as the mic, so if the wake word resumes while the reply is still
   # audible the reply audio false-triggers "Okay Nabu" (observed: avg prob 0.59,
@@ -138,6 +155,7 @@ voice_assistant:
   # reply, then hold a short guard for the acoustic tail/echo, and only THEN
   # resume wake-word detection.
   on_end:
+    - lambda: 'id(patio_hub_ui)->set_voice_listening(false);'
     - delay: 300ms  # let TTS playback reach the speaker (state -> RUNNING)
     - wait_until:
         condition:
@@ -150,6 +168,7 @@ voice_assistant:
   # If the pipeline errors out, make sure the wake word engine comes back. Same
   # speaker-drain guard in case the error arrived mid-playback.
   on_error:
+    - lambda: 'id(patio_hub_ui)->set_voice_listening(false);'
     - delay: 300ms
     - wait_until:
         condition:
@@ -175,3 +194,32 @@ api:
         then:
           - micro_wake_word.start:
               id: patio_mww
+
+# Runtime-adjustable wake-word sensitivity, surfaced to Home Assistant as a
+# number entity. Higher % = stricter phrase match = fewer false triggers (e.g.
+# a TV in the background) but requires clearer/closer speech; lower % wakes more
+# eagerly. micro_wake_word stores the 0..1 probability cutoff quantized to a
+# uint8_t (0..255), so we convert percent -> 0..255 here. The value is restored
+# across reboots and re-applied late in on_boot (after mww builds its model
+# list). Default 75%.
+number:
+  - platform: template
+    id: mww_cutoff
+    name: "Wake Word Sensitivity"
+    icon: "mdi:microphone-settings"
+    entity_category: config
+    unit_of_measurement: "%"
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 75
+    restore_value: true
+    optimistic: true
+    on_value:
+      - lambda: |-
+          if (isnan(x)) return;
+          uint8_t cutoff = (uint8_t) lroundf(x / 100.0f * 255.0f);
+          for (auto *m : id(patio_mww)->get_wake_words())
+            m->set_probability_cutoff(cutoff);
+          ESP_LOGI("mww_cutoff", "probability cutoff -> %u/255 (%.0f%%)", cutoff, x);

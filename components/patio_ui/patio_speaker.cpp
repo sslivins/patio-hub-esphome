@@ -1,6 +1,6 @@
 #include "patio_speaker.h"
 
-#ifdef USE_ESP32
+#if defined(USE_ESP32) && defined(USE_SPEAKER)
 
 #include "esphome/components/audio/audio.h"
 #include "esphome/core/hal.h"

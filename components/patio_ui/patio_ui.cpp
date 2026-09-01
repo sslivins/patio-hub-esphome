@@ -358,6 +358,9 @@ void PatioUI::build_ui_() {
       case TK_MEDIA:
         this->build_media_tile_(tile);
         break;
+      case TK_CALL:
+        this->build_call_tile_(tile);
+        break;
       default:
         break;
     }
@@ -422,6 +425,22 @@ void PatioUI::build_ui_() {
   this->tick_timer_ = lv_timer_create(PatioUI::tick_cb_, 1000, this);
   // Fast red/white flash driver for the final EXPIRY_FLASH_SECS (LVGL task).
   this->flash_timer_ = lv_timer_create(PatioUI::flash_cb_, 350, this);
+#ifdef PATIO_AUDIO
+  // Voice "listening" glow: a full-screen, input-transparent frame on the top
+  // layer whose border colour cycles through the rainbow and pulses in width +
+  // opacity while the voice assistant is active (see set_voice_listening()).
+  // Hidden and un-animated until a wake word starts a pipeline.
+  this->voice_border_ = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(this->voice_border_);
+  lv_obj_set_size(this->voice_border_, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_opa(this->voice_border_, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_radius(this->voice_border_, 14, 0);
+  lv_obj_set_style_border_width(this->voice_border_, 8, 0);
+  lv_obj_set_style_border_color(this->voice_border_, lv_color_hex(0x00A0FF), 0);
+  lv_obj_set_style_border_opa(this->voice_border_, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(this->voice_border_, LV_OBJ_FLAG_CLICKABLE);  // taps fall through
+  lv_obj_add_flag(this->voice_border_, LV_OBJ_FLAG_HIDDEN);
+#endif
   this->refresh_heater_ui_();
 }
 
@@ -501,6 +520,71 @@ void PatioUI::build_heater_tile_(lv_obj_t *tile) {
   lv_obj_set_style_bg_opa(this->heater_btn_right_, LV_OPA_COVER, 0);
   this->heater_btn_right_lbl_ = lv_obj_get_child(this->heater_btn_right_, 0);
   lv_obj_set_style_text_color(this->heater_btn_right_lbl_, lv_color_black(), 0);
+}
+
+// --- call tile: one big button that fires a HA script/service ---
+// A single centred "Call" button. Pressing it latches pending_call_ (drained on
+// the main task in loop(), where the native API lives) and briefly shows a
+// "Sent" confirmation. Intended for a dedicated single-purpose device, but it's
+// just another swipeable tile so more tiles/voice can be added alongside it.
+static void ev_call_press(lv_event_t *e) {
+  auto *self = static_cast<PatioUI *>(lv_event_get_user_data(e));
+  self->on_call_pressed();
+}
+
+void PatioUI::call_reenable_cb_(lv_timer_t *t) {
+  auto *self = static_cast<PatioUI *>(lv_timer_get_user_data(t));
+  if (self->call_btn_ != nullptr)
+    lv_obj_clear_state(self->call_btn_, LV_STATE_DISABLED);  // unlock for the next call
+  if (self->call_status_ != nullptr)
+    lv_label_set_text(self->call_status_, "");
+  lv_timer_del(t);  // one-shot
+}
+
+void PatioUI::on_call_pressed() {
+  // Ignore taps while the button is locked so rapid presses can't queue up
+  // multiple announcements. The lock is released by call_reenable_cb_ after the
+  // cooldown (which comfortably covers the Sonos announcement).
+  if (this->call_btn_ != nullptr && lv_obj_has_state(this->call_btn_, LV_STATE_DISABLED))
+    return;
+  // Latch the intent for the main task; never touch the API from the LVGL task.
+  this->pending_call_.store(true);
+  if (this->call_btn_ != nullptr)
+    lv_obj_add_state(this->call_btn_, LV_STATE_DISABLED);  // grey out + block further taps
+  if (this->call_status_ != nullptr)
+    lv_label_set_text(this->call_status_, LV_SYMBOL_OK " Sent");
+  // Self-deleting one-shot re-enables the button after the cooldown.
+  lv_timer_create(PatioUI::call_reenable_cb_, this->call_cooldown_ms_, this);
+}
+
+void PatioUI::build_call_tile_(lv_obj_t *tile) {
+  lv_obj_set_style_bg_color(tile, lv_color_hex(0x101014), 0);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+
+  lv_obj_t *btn = make_btn(tile, this->call_label_.c_str(), ev_call_press, this);
+  lv_obj_set_size(btn, 210, 140);
+  lv_obj_align(btn, LV_ALIGN_CENTER, 0, -12);
+  lv_obj_set_style_radius(btn, 24, 0);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0xD32F2F), 0);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x8E1F1F), LV_STATE_PRESSED);  // darker while held
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x4A4A4A), LV_STATE_DISABLED);  // greyed while locked
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_DISABLED);
+  lv_obj_set_style_shadow_width(btn, 24, 0);
+  lv_obj_set_style_shadow_color(btn, lv_color_hex(0xD32F2F), 0);
+  lv_obj_set_style_shadow_opa(btn, LV_OPA_40, 0);
+  this->call_btn_ = btn;
+  {
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_48, 0);
+  }
+
+  this->call_status_ = lv_label_create(tile);
+  lv_obj_set_style_text_color(this->call_status_, lv_color_hex(0x77E27A), 0);
+  lv_obj_set_style_text_font(this->call_status_, &lv_font_montserrat_28, 0);
+  lv_label_set_text(this->call_status_, "");
+  lv_obj_align(this->call_status_, LV_ALIGN_BOTTOM_MID, 0, -34);
 }
 
 // --- clock + outside-temperature tile (the resting screen) ---
@@ -1059,6 +1143,54 @@ void PatioUI::flash_tick_() {
     lv_obj_set_style_text_color(this->heater_value_, lv_color_white(), 0);
     this->label_dirty_.store(true);
   }
+}
+
+// Voice "listening" glow border ------------------------------------------------
+// set_voice_listening() is called from the voice_assistant automations (main/VA
+// task), so it takes the LVGL lock before touching widgets/timers. The pulse
+// itself runs on the LVGL task via voice_border_timer_.
+void PatioUI::set_voice_listening(bool on) {
+  if (this->voice_border_ == nullptr)
+    return;  // board without the audio UI — nothing to show
+  bsp_display_lock(0);
+  if (on) {
+    // If the screen had gone to sleep, wake it so the glow is actually visible
+    // (backlight rail on + eyelids open). Safe here: we hold the display lock,
+    // which serialises with the LVGL task that wake_screen() normally runs on.
+    if (this->screen_asleep_)
+      this->wake_screen();
+    lv_obj_clear_flag(this->voice_border_, LV_OBJ_FLAG_HIDDEN);
+    if (this->voice_border_timer_ == nullptr)
+      this->voice_border_timer_ = lv_timer_create(PatioUI::voice_border_cb_, 40, this);
+  } else {
+    if (this->voice_border_timer_ != nullptr) {
+      lv_timer_del(this->voice_border_timer_);
+      this->voice_border_timer_ = nullptr;
+    }
+    lv_obj_add_flag(this->voice_border_, LV_OBJ_FLAG_HIDDEN);
+  }
+  bsp_display_unlock();
+}
+
+void PatioUI::voice_border_cb_(lv_timer_t *t) {
+  static_cast<PatioUI *>(lv_timer_get_user_data(t))->voice_border_tick_();
+}
+
+void PatioUI::voice_border_tick_() {
+  if (this->voice_border_ == nullptr)
+    return;
+  // Cycle the hue for the rainbow sweep, and drive a triangle wave for the
+  // width/opacity pulse so the border "breathes".
+  this->voice_hue_ = (uint16_t) ((this->voice_hue_ + 6) % 360);
+  this->voice_pulse_ = (uint8_t) (this->voice_pulse_ + 8);  // free-running 0..255
+  uint8_t tri = this->voice_pulse_ < 128 ? (uint8_t) (this->voice_pulse_ * 2)
+                                         : (uint8_t) ((255 - this->voice_pulse_) * 2);
+  lv_opa_t opa = (lv_opa_t) (90 + (tri * (255 - 90)) / 255);  // pulse 90..255
+  int32_t w = 5 + (tri * 7) / 255;                            // pulse 5..12 px
+  lv_color_t c = lv_color_hsv_to_rgb(this->voice_hue_, 100, 100);
+  lv_obj_set_style_border_color(this->voice_border_, c, 0);
+  lv_obj_set_style_border_opa(this->voice_border_, opa, 0);
+  lv_obj_set_style_border_width(this->voice_border_, w, 0);
 }
 
 void PatioUI::tick_() {
@@ -2464,6 +2596,85 @@ void PatioUI::audio_selftest_() {
 }
 #endif  // PATIO_AUDIO
 
+// Short two-tone "ding" out the onboard speaker as local press feedback for the
+// call button. Runs on the MAIN task (blocks ~0.26 s inside esp_codec_dev_write)
+// so it never stalls the LVGL render task. Reuses the BSP codec path proven by
+// audio_selftest_ (bsp_audio_codec_speaker_init -> AW88298 over the shared duplex
+// I2S bus); the codec handle is cached after the first init. Defined outside the
+// PATIO_AUDIO guard (with a no-op body) so boards without audio still link.
+void PatioUI::play_call_chime_() {
+#ifdef PATIO_AUDIO
+  esp_codec_dev_handle_t spk = static_cast<esp_codec_dev_handle_t>(this->call_spk_codec_);
+  if (spk == nullptr) {
+    spk = bsp_audio_codec_speaker_init();
+    this->call_spk_codec_ = spk;
+  }
+  if (spk == nullptr) {
+    ESP_LOGW(TAG, "call chime: speaker codec init failed");
+    return;
+  }
+
+  esp_codec_dev_sample_info_t fs = {};
+  fs.bits_per_sample = 16;
+  fs.channel = 1;
+  fs.channel_mask = 0;
+  fs.sample_rate = 16000;
+  fs.mclk_multiple = 0;
+
+  // Two rising notes (~110 ms 660 Hz then ~150 ms 990 Hz) with short
+  // raised-cosine edges so there's no click at the note boundaries. Buffer lives
+  // in PSRAM: internal RAM is nearly exhausted by the LVGL draw buffers.
+  const int sr = 16000;
+  const int n1 = sr * 110 / 1000;
+  const int n2 = sr * 150 / 1000;
+  const int total = n1 + n2;
+  const int fade = sr * 8 / 1000;  // ~8 ms fade in/out per note
+  int16_t *buf = static_cast<int16_t *>(heap_caps_malloc(total * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  if (buf == nullptr) {
+    ESP_LOGW(TAG, "call chime: tone alloc failed");
+    return;
+  }
+  auto fill = [&](int off, int n, float freq) {
+    for (int i = 0; i < n; i++) {
+      float env = 1.0f;
+      if (i < fade)
+        env = 0.5f * (1.0f - cosf((float) M_PI * i / fade));
+      else if (i > n - fade)
+        env = 0.5f * (1.0f - cosf((float) M_PI * (n - i) / fade));
+      buf[off + i] = static_cast<int16_t>(26000.0f * env * sinf(2.0f * (float) M_PI * freq * i / sr));
+    }
+  };
+  fill(0, n1, 660.0f);
+  fill(n1, n2, 990.0f);
+
+  if (esp_codec_dev_open(spk, &fs) == ESP_OK) {
+    esp_codec_dev_set_out_vol(spk, 100);
+    // Force the AW88298 digital volume register to true 0 dB (the BSP's
+    // pa_gain=15 otherwise caps playback at -15 dB). DIGITAL-only write over the
+    // shared BSP I2C bus (AW88298 @ 0x36, REG0C hi=0x00 -> 0 dB). See
+    // audio_selftest_ for the full rationale — no analog/boost change.
+    i2c_master_bus_handle_t abus = bsp_i2c_get_handle();
+    if (abus != nullptr) {
+      i2c_device_config_t aw_cfg = {};
+      aw_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+      aw_cfg.device_address = 0x36;  // AW88298
+      aw_cfg.scl_speed_hz = 100000;
+      i2c_master_dev_handle_t aw = nullptr;
+      if (i2c_master_bus_add_device(abus, &aw_cfg, &aw) == ESP_OK) {
+        const uint8_t vol_0db[] = {0x0C, 0x00, 0x64};  // REG0C hi=0x00 -> 0 dB
+        i2c_master_transmit(aw, vol_0db, sizeof(vol_0db), 1000);
+        i2c_master_bus_rm_device(aw);
+      }
+    }
+    esp_codec_dev_write(spk, buf, total * sizeof(int16_t));
+    esp_codec_dev_close(spk);
+  } else {
+    ESP_LOGW(TAG, "call chime: speaker open failed");
+  }
+  free(buf);
+#endif  // PATIO_AUDIO
+}
+
 void PatioUI::setup() {
   ESP_LOGI(TAG, "bringing up display + LVGL");
 
@@ -2698,6 +2909,14 @@ void PatioUI::loop() {
   if (this->pending_stop_.exchange(false)) {
     ESP_LOGI(TAG, "heater stop -> %s", this->stop_script_.c_str());
     this->call_homeassistant_service(this->stop_script_);
+  }
+  // Drain a pending call-button press: play a local press chime, then fire the
+  // configured HA script/service. Both run on the main task.
+  if (this->pending_call_.exchange(false)) {
+    if (this->call_sound_)
+      this->play_call_chime_();
+    ESP_LOGI(TAG, "call button -> %s", this->call_script_.c_str());
+    this->call_homeassistant_service(this->call_script_);
   }
   // Drain a pending extend: restart the HA timer with a second-precise duration
   // (heater is already on; only the timer needs lengthening).

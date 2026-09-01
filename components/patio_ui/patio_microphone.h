@@ -1,6 +1,9 @@
 #pragma once
 
-#ifdef USE_ESP32
+// Only compiled when the `microphone:` platform is actually declared in the YAML
+// (USE_MICROPHONE). A minimal build that omits it (e.g. the call-button device)
+// otherwise fails on the missing microphone base header.
+#if defined(USE_ESP32) && defined(USE_MICROPHONE)
 
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/core/component.h"

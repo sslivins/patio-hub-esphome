@@ -1,6 +1,9 @@
 #pragma once
 
-#ifdef USE_ESP32
+// Only compiled when the `speaker:` platform is actually declared in the YAML
+// (USE_SPEAKER). A minimal build that omits the speaker platform (e.g. the
+// call-button device) otherwise fails on the missing speaker base header.
+#if defined(USE_ESP32) && defined(USE_SPEAKER)
 
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"

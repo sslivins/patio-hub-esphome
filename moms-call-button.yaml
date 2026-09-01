@@ -1,0 +1,70 @@
+# ============================================================================
+# Mom's Call Button  —  M5Stack CoreS3  (single-purpose, built on patio_ui)
+#
+# A dedicated one-button device: the screen shows a single big "Call" button;
+# pressing it fires the Home Assistant script `script.call_button_announce`,
+# which makes the kitchen + living-room Sonos speakers announce
+# "Come to Mom's Room".
+#
+# It deliberately reuses the shared patio_ui component framework (via the common
+# package) so more tiles/screens — and eventually the voice assistant — can be
+# added later just by extending the `tiles:` list. For now only the `call` tile
+# is built.
+#
+# Lives on the HOME network / Home Assistant (homeassistant.mi), where the Sonos
+# speakers and the announce script are.
+#
+# FIRST FLASH MUST BE WIRED USB (a blank board can't OTA); the CoreS3's USB-C
+# port connects straight to the ESP32-S3. After the first flash, OTA works.
+# ============================================================================
+substitutions:
+  name: moms-call-button
+  friendly_name: Mom's Call Button
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: m5stack-cores3
+  # CoreS3 ships 16 MB flash; declare it so ESPHome sizes the OTA app partitions
+  # correctly (same rationale as the patio hub).
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Integrate PSRAM into the general heap and push the big WiFi/LWIP buffers
+      # out to PSRAM so internal RAM stays free (same fix as the patio hub).
+      CONFIG_SPIRAM_USE_MALLOC: y
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: y
+      CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL: "32768"
+
+# CoreS3 is an ESP32-S3-WROOM-1 module with 8 MB *quad* PSRAM (see patio hub).
+psram:
+  mode: quad
+  speed: 80MHz
+
+packages:
+  common: !include common/patio-hub-common.yaml
+
+# Reuse the shared patio_ui component, but on the CoreS3 BSP and configured for
+# just the single Call tile. Everything else the common package sets (heater /
+# screens / media config) is inherited but never shown, because those tiles are
+# not in the `tiles:` list below.
+patio_ui:
+  variant: cores3
+  tiles:
+    - call
+  call:
+    script: script.call_button_announce
+    label: Call
+
+# The common package sets the API key to the patio hub's; give this device its
+# own so both can live in Home Assistant at once.
+api:
+  encryption:
+    key: !secret call_button_api_key
+
+# Keep the log light (the common package defaults to DEBUG).
+logger:
+  level: INFO

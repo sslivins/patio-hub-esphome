@@ -57,8 +57,9 @@ class PatioUI : public Component, public api::CustomAPIDevice {
     TK_LIGHTS = 3,
     TK_SCREENS = 4,
     TK_MEDIA = 5,
+    TK_CALL = 6,
   };
-  static constexpr int MAX_TILES = 6;
+  static constexpr int MAX_TILES = 7;
   // YAML codegen: append a tile kind to the ordered tile set.
   void add_tile(int kind);
   // Revert to the clock tile (or the heater tile if a timer is running) after
@@ -89,6 +90,14 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   // YAML-configurable Home Assistant contract.
   void set_run_script(const std::string &s) { this->run_script_ = s; }
   void set_stop_script(const std::string &s) { this->stop_script_ = s; }
+  // Call tile: the HA script/service fired when the big button is pressed, and
+  // the button's on-screen label.
+  void set_call_script(const std::string &s) { this->call_script_ = s; }
+  void set_call_label(const std::string &s) { this->call_label_ = s; }
+  // Call tile: how long the button stays locked after a press (prevents queuing
+  // repeated announcements), and whether to play a local press chime.
+  void set_call_cooldown_ms(uint32_t ms) { this->call_cooldown_ms_ = ms; }
+  void set_call_sound(bool on) { this->call_sound_ = on; }
   void set_timer_entity(const std::string &s) { this->timer_entity_ = s; }
   void set_temp_sensor(const std::string &s) { this->temp_sensor_ = s; }
   void set_time(time::RealTimeClock *t) { this->time_ = t; }
@@ -106,6 +115,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void on_heater_roller_changed();    // scroll picker moved: store minutes
   void on_heater_cancel();            // left button: stop if running, else reset picker
   void on_heater_action();            // right button: Start (idle) / +15 min (running)
+  void on_call_pressed();             // call tile: latch intent + lock button (LVGL task)
   void adjust_setpoint(int delta);
 
   // --- perimeter screen controls ---
@@ -190,6 +200,12 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void go_home_tile();                    // LVGL task — swipe up -> clock tile
   void wake_screen();                     // LVGL task — backlight on, swallow the waking tap
 
+  // Voice "listening" indicator: a pulsing, rainbow glowing border around the
+  // screen shown while the voice assistant is active. Safe to call from the
+  // voice_assistant/main task (wraps LVGL access in bsp_display_lock); no-ops on
+  // boards without the audio UI (voice_border_ stays null).
+  void set_voice_listening(bool on);
+
  protected:
   // --- display / UI bring-up ---
   void build_ui_();
@@ -231,6 +247,8 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void tick_();               // 1 Hz, LVGL task
   static void flash_cb_(lv_timer_t *t);
   void flash_tick_();         // fast red/white flash in the final seconds, LVGL task
+  static void voice_border_cb_(lv_timer_t *t);
+  void voice_border_tick_();  // LVGL task — animate the pulsing/rainbow listening border
   void refresh_heater_ui_();  // LVGL task only — dial value/sub + arc
   void build_time_tile_(lv_obj_t *tile);     // LVGL task only
   void refresh_time_tile_();                 // LVGL task only — clock + temperature
@@ -262,11 +280,19 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   void refresh_media_ui_();                  // LVGL task only
   void build_heater_tile_(lv_obj_t *tile);   // LVGL task only — iOS-timer style picker/countdown
   void build_climate_tile_(lv_obj_t *tile);  // LVGL task only — thermostat controls
+  void build_call_tile_(lv_obj_t *tile);     // LVGL task only — single big "Call" button
+  static void call_reenable_cb_(lv_timer_t *t);  // LVGL task: re-enable button after cooldown
+  void play_call_chime_();                    // MAIN task: short press ding via BSP codec
   void refresh_climate_ui_();                // LVGL task only — setpoint/current/mode/fan + bg
 
   // --- config ---
   std::string run_script_{"script.patio_heater_run"};
   std::string stop_script_{"script.patio_heater_stop"};
+  std::string call_script_{"script.call_button_announce"};
+  std::string call_label_{"Call"};
+  uint32_t call_cooldown_ms_{6000};  // lock the Call button this long after a press
+  bool call_sound_{true};            // play a local press chime through the speaker
+  void *call_spk_codec_{nullptr};    // cached esp_codec_dev_handle_t for the chime
   std::string timer_entity_{"timer.patio_heaters"};
   std::string temp_sensor_{"sensor.usl_environmental_temperature_3"};
   time::RealTimeClock *time_{nullptr};
@@ -285,10 +311,19 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   lv_obj_t *heater_btn_left_{nullptr};    // Cancel
   lv_obj_t *heater_btn_right_{nullptr};   // Start / +15 min
   lv_obj_t *heater_btn_right_lbl_{nullptr};
+  lv_obj_t *call_btn_{nullptr};        // single big "Call" button (call tile)
+  lv_obj_t *call_status_{nullptr};     // brief "sent" confirmation label
   lv_timer_t *tick_timer_{nullptr};
   lv_timer_t *flash_timer_{nullptr};   // final-seconds red/white flasher
   bool flash_on_{false};               // current flash phase (LVGL task only)
   bool flashing_{false};               // true while the flasher owns the tile
+
+  // Voice "listening" glow border (top layer, full-screen, input-transparent).
+  // voice_border_timer_ is non-null only while the pulse animation is running.
+  lv_obj_t *voice_border_{nullptr};
+  lv_timer_t *voice_border_timer_{nullptr};
+  uint16_t voice_hue_{0};    // 0..359 rainbow phase (LVGL task only)
+  uint8_t voice_pulse_{0};   // 0..255 pulse phase (LVGL task only)
 
   // tileview + bottom page-position dots (LVGL task only). The active tile set
   // + order is configured via YAML `tiles:`; only `num_tiles_` of these slots
@@ -414,6 +449,7 @@ class PatioUI : public Component, public api::CustomAPIDevice {
   std::atomic<int> pending_start_{-1};        // minutes to start, -1 = none
   std::atomic<int> pending_extend_secs_{-1};  // new total secs for timer.start, -1 = none
   std::atomic<bool> pending_stop_{false};
+  std::atomic<bool> pending_call_{false};     // call-tile button pressed -> fire call_script_
   std::atomic<bool> label_dirty_{true};       // request LVGL-task label refresh
 
   // screens: UI -> HA pending cover action (Somfy RTS = command-only, no state)

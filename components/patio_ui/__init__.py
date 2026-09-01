@@ -9,6 +9,10 @@ DEPENDENCIES = ["esp32", "api", "time"]
 
 CONF_RUN_SCRIPT = "run_script"
 CONF_STOP_SCRIPT = "stop_script"
+CONF_CALL = "call"
+CONF_SCRIPT = "script"
+CONF_COOLDOWN = "cooldown"
+CONF_SOUND = "sound"
 CONF_TIMER_ENTITY = "timer_entity"
 CONF_TEMP_SENSOR = "temp_sensor"
 CONF_DEFAULT_MINUTES = "default_minutes"
@@ -40,6 +44,7 @@ TILE_KINDS = {
     "lights": 3,
     "screens": 4,
     "media": 5,
+    "call": 6,
 }
 # Default tile set = the original patio layout, so existing configs that omit
 # `tiles:` behave exactly as before.
@@ -177,6 +182,19 @@ CLIMATE_SCHEMA = cv.Schema(
     }
 )
 
+# Single "Call" button tile: fires a HA script/service on press.
+CALL_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_SCRIPT, default="script.call_button_announce"): cv.string,
+        cv.Optional(CONF_LABEL, default="Call"): cv.string,
+        # How long the Call button stays locked after a press, so rapid taps
+        # can't queue up multiple announcements.
+        cv.Optional(CONF_COOLDOWN, default="6s"): cv.positive_time_period_milliseconds,
+        # Play a short local chime on the onboard speaker when pressed.
+        cv.Optional(CONF_SOUND, default=True): cv.boolean,
+    }
+)
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(PatioUI),
@@ -199,6 +217,7 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_MEDIA): MEDIA_SCHEMA,
         cv.Optional(CONF_CLIMATE): CLIMATE_SCHEMA,
+        cv.Optional(CONF_CALL): CALL_SCHEMA,
         cv.Optional(CONF_TILES, default=DEFAULT_TILES): cv.ensure_list(
             cv.one_of(*TILE_KINDS, lower=True)
         ),
@@ -215,6 +234,14 @@ async def to_code(config):
 
     cg.add(var.set_run_script(config[CONF_RUN_SCRIPT]))
     cg.add(var.set_stop_script(config[CONF_STOP_SCRIPT]))
+
+    # Call tile: HA script/service + button label (defaults applied by schema).
+    if CONF_CALL in config:
+        call = config[CONF_CALL]
+        cg.add(var.set_call_script(call[CONF_SCRIPT]))
+        cg.add(var.set_call_label(call[CONF_LABEL]))
+        cg.add(var.set_call_cooldown_ms(call[CONF_COOLDOWN]))
+        cg.add(var.set_call_sound(call[CONF_SOUND]))
     cg.add(var.set_timer_entity(config[CONF_TIMER_ENTITY]))
     cg.add(var.set_temp_sensor(config[CONF_TEMP_SENSOR]))
     if CONF_TIME_ID in config:
